@@ -155,7 +155,7 @@ class CollectionPipeline:
                 async def _pull_one(player: dict) -> int:
                     async with sem:
                         if self._stop:
-                            return 0
+                            return 0, player["puuid"], []
                         try:
                             match_ids = await self.client.get_match_ids(
                                 routing=player["routing"],
@@ -163,20 +163,7 @@ class CollectionPipeline:
                                 queue=self.cfg["collection"]["queue_id"],
                                 count=self.cfg["collection"]["matches_per_player"],
                             )
-                            new = 0
-                            for mid in match_ids:
-                                is_new = await self.state.upsert_match(
-                                    match_id=mid,
-                                    platform=platform,
-                                    routing=routing,
-                                )
-                                if is_new:
-                                    new += 1
-
-                            await self.state.mark_player_matches_pulled(
-                                player["puuid"]
-                            )
-                            return new
+                            return len(match_ids), player["puuid"], match_ids
 
                         except Exception as e:
                             logger.error(
@@ -184,11 +171,30 @@ class CollectionPipeline:
                                 player["puuid"][:12],
                                 e,
                             )
-                            return 0
+                            return 0, player["puuid"], []
 
                 tasks = [_pull_one(p) for p in players]
                 results = await asyncio.gather(*tasks)
-                batch_new = sum(results)
+
+                unique_match_ids: set[str] = set()
+                player_ids: list[str] = []
+                for _, puuid, mids in results:
+                    player_ids.append(puuid)
+                    unique_match_ids.update(mids)
+
+                batch_new = 0
+                for mid in unique_match_ids:
+                    is_new = await self.state.upsert_match(
+                        match_id=mid,
+                        platform=platform,
+                        routing=routing,
+                    )
+                    if is_new:
+                        batch_new += 1
+
+                for puuid in player_ids:
+                    await self.state.mark_player_matches_pulled(puuid)
+
                 total_new += batch_new
                 await self.state.commit()
 

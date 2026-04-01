@@ -55,10 +55,18 @@ class KeyRateLimiter:
             # make request
     """
 
-    def __init__(self, key_id: str, per_second: int, per_two_minutes: int):
+    def __init__(
+        self,
+        key_id: str,
+        per_second: int,
+        per_two_minutes: int,
+        safety_margin: float = 0.8,
+    ):
         self.key_id = key_id
-        self._short = RateWindow(max_tokens=per_second, window_seconds=1.0)
-        self._long = RateWindow(max_tokens=per_two_minutes, window_seconds=120.0)
+        short_tokens = max(1, int(per_second * safety_margin))
+        long_tokens = max(1, int(per_two_minutes * safety_margin))
+        self._short = RateWindow(max_tokens=short_tokens, window_seconds=1.0)
+        self._long = RateWindow(max_tokens=long_tokens, window_seconds=120.0)
         self._lock = asyncio.Lock()
         self._retry_after: float = 0.0  # monotonic time when 429 cooldown ends
 
@@ -112,8 +120,20 @@ class MultiKeyLimiter:
         self._limiters: dict[str, KeyRateLimiter] = {}
         self._keys: dict[str, str] = {}  # key_id -> actual API key string
 
-    def add_key(self, key_id: str, api_key: str, per_second: int, per_two_minutes: int) -> None:
-        self._limiters[key_id] = KeyRateLimiter(key_id, per_second, per_two_minutes)
+    def add_key(
+        self,
+        key_id: str,
+        api_key: str,
+        per_second: int,
+        per_two_minutes: int,
+        safety_margin: float = 0.8,
+    ) -> None:
+        self._limiters[key_id] = KeyRateLimiter(
+            key_id,
+            per_second,
+            per_two_minutes,
+            safety_margin=safety_margin,
+        )
         self._keys[key_id] = api_key
 
     def get_api_key(self, key_id: str) -> str:

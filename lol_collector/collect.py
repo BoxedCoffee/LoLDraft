@@ -108,6 +108,7 @@ def build_limiter(cfg: dict) -> MultiKeyLimiter:
     """Build multi-key rate limiter from config."""
     limiter = MultiKeyLimiter()
     rate_defaults = cfg.get("rate_limits", {})
+    safety_margin = rate_defaults.get("safety_margin", 0.8)
 
     for i, key_cfg in enumerate(cfg["api_keys"]):
         key_id = f"key_{i}"
@@ -128,7 +129,7 @@ def build_limiter(cfg: dict) -> MultiKeyLimiter:
             per_s = rate_defaults.get("development", {}).get("per_second", 20)
             per_2m = rate_defaults.get("development", {}).get("per_two_minutes", 100)
 
-        limiter.add_key(key_id, api_key, per_s, per_2m)
+        limiter.add_key(key_id, api_key, per_s, per_2m, safety_margin=safety_margin)
         logger.info(
             "Registered key %s (%s): %d/s, %d/2min",
             key_id,
@@ -205,8 +206,9 @@ async def run(cfg: dict, stage: str = None) -> None:
 
     concurrency = cfg.get("concurrency", {}).get("max_concurrent_per_key", 10)
     total_concurrency = concurrency * len(cfg["api_keys"])
+    max_in_flight = cfg.get("concurrency", {}).get("max_in_flight", min(8, total_concurrency))
 
-    async with RiotClient(limiter, retry_cfg, key_region_map) as client:
+    async with RiotClient(limiter, retry_cfg, key_region_map, max_in_flight=max_in_flight) as client:
         pipeline = CollectionPipeline(
             client=client,
             state=state,

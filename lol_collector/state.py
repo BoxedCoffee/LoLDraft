@@ -10,6 +10,7 @@ Tracks:
 All operations are async via aiosqlite.
 """
 
+import asyncio
 import logging
 from datetime import datetime, timezone
 from enum import IntEnum
@@ -77,12 +78,14 @@ class StateDB:
     def __init__(self, db_path: str):
         self._db_path = db_path
         self._db: Optional[aiosqlite.Connection] = None
+        self._write_lock = asyncio.Lock()
 
     async def connect(self) -> None:
         self._db = await aiosqlite.connect(self._db_path)
         self._db.row_factory = aiosqlite.Row
         await self._db.execute("PRAGMA journal_mode=WAL")
         await self._db.execute("PRAGMA synchronous=NORMAL")
+        await self._db.execute("PRAGMA busy_timeout=30000")
         await self._db.executescript(SCHEMA)
         await self._db.commit()
         logger.info("State DB connected: %s", self._db_path)
@@ -105,20 +108,21 @@ class StateDB:
     ) -> bool:
         """Insert or update a player. Returns True if newly inserted."""
         now = datetime.now(timezone.utc).isoformat()
-        cursor = await self._db.execute(
-            "SELECT puuid FROM players WHERE puuid = ?", (puuid,)
-        )
-        existing = await cursor.fetchone()
-
-        if existing:
-            await self._db.execute(
-                """UPDATE players SET tier=COALESCE(?,tier), lp=?,
-                   summoner_id=COALESCE(?,summoner_id), updated_at=?
-                   WHERE puuid=?""",
-                (tier, lp, summoner_id, now, puuid),
+        async with self._write_lock:
+            cursor = await self._db.execute(
+                "SELECT puuid FROM players WHERE puuid = ?", (puuid,)
             )
-            return False
-        else:
+            existing = await cursor.fetchone()
+
+            if existing:
+                await self._db.execute(
+                    """UPDATE players SET tier=COALESCE(?,tier), lp=?,
+                       summoner_id=COALESCE(?,summoner_id), updated_at=?
+                       WHERE puuid=?""",
+                    (tier, lp, summoner_id, now, puuid),
+                )
+                return False
+
             await self._db.execute(
                 """INSERT INTO players
                    (puuid, platform, routing, summoner_id, tier, lp,
@@ -151,10 +155,11 @@ class StateDB:
 
     async def mark_player_matches_pulled(self, puuid: str) -> None:
         now = datetime.now(timezone.utc).isoformat()
-        await self._db.execute(
-            "UPDATE players SET matches_pulled=1, updated_at=? WHERE puuid=?",
-            (now, puuid),
-        )
+        async with self._write_lock:
+            await self._db.execute(
+                "UPDATE players SET matches_pulled=1, updated_at=? WHERE puuid=?",
+                (now, puuid),
+            )
 
     async def player_count(self, platform: str = None) -> int:
         if platform:
@@ -180,51 +185,52 @@ class StateDB:
     ) -> bool:
         """Insert or update a match. Returns True if newly inserted."""
         now = datetime.now(timezone.utc).isoformat()
-        cursor = await self._db.execute(
-            "SELECT match_id FROM matches WHERE match_id = ?", (match_id,)
-        )
-        existing = await cursor.fetchone()
-
-        if existing:
-            updates = ["updated_at=?"]
-            params = [now]
-            if game_version:
-                updates.append("game_version=?")
-                params.append(game_version)
-            if game_duration is not None:
-                updates.append("game_duration=?")
-                params.append(game_duration)
-            if queue_id is not None:
-                updates.append("queue_id=?")
-                params.append(queue_id)
-            if status != MatchStatus.DISCOVERED:
-                updates.append("status=?")
-                params.append(int(status))
-            params.append(match_id)
-            await self._db.execute(
-                f"UPDATE matches SET {','.join(updates)} WHERE match_id=?",
-                params,
+        async with self._write_lock:
+            cursor = await self._db.execute(
+                "SELECT match_id FROM matches WHERE match_id = ?", (match_id,)
             )
-            return False
+            existing = await cursor.fetchone()
 
-        await self._db.execute(
-            """INSERT INTO matches
-               (match_id, platform, routing, status, game_version,
-                game_duration, queue_id, discovered_at, updated_at)
-               VALUES (?,?,?,?,?,?,?,?,?)""",
-            (
-                match_id,
-                platform,
-                routing,
-                int(status),
-                game_version,
-                game_duration,
-                queue_id,
-                now,
-                now,
-            ),
-        )
-        return True
+            if existing:
+                updates = ["updated_at=?"]
+                params = [now]
+                if game_version:
+                    updates.append("game_version=?")
+                    params.append(game_version)
+                if game_duration is not None:
+                    updates.append("game_duration=?")
+                    params.append(game_duration)
+                if queue_id is not None:
+                    updates.append("queue_id=?")
+                    params.append(queue_id)
+                if status != MatchStatus.DISCOVERED:
+                    updates.append("status=?")
+                    params.append(int(status))
+                params.append(match_id)
+                await self._db.execute(
+                    f"UPDATE matches SET {','.join(updates)} WHERE match_id=?",
+                    params,
+                )
+                return False
+
+            await self._db.execute(
+                """INSERT INTO matches
+                   (match_id, platform, routing, status, game_version,
+                    game_duration, queue_id, discovered_at, updated_at)
+                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                (
+                    match_id,
+                    platform,
+                    routing,
+                    int(status),
+                    game_version,
+                    game_duration,
+                    queue_id,
+                    now,
+                    now,
+                ),
+            )
+            return True
 
     async def update_match_status(
         self, match_id: str, status: MatchStatus, **kwargs
@@ -236,9 +242,10 @@ class StateDB:
             sets.append(f"{k}=?")
             params.append(v)
         params.append(match_id)
-        await self._db.execute(
-            f"UPDATE matches SET {','.join(sets)} WHERE match_id=?", params
-        )
+        async with self._write_lock:
+            await self._db.execute(
+                f"UPDATE matches SET {','.join(sets)} WHERE match_id=?", params
+            )
 
     async def get_matches_by_status(
         self,
@@ -275,12 +282,13 @@ class StateDB:
 
     async def start_run(self, config_hash: str = None) -> int:
         now = datetime.now(timezone.utc).isoformat()
-        cursor = await self._db.execute(
-            "INSERT INTO collection_runs (started_at, config_hash) VALUES (?,?)",
-            (now, config_hash),
-        )
-        await self._db.commit()
-        return cursor.lastrowid
+        async with self._write_lock:
+            cursor = await self._db.execute(
+                "INSERT INTO collection_runs (started_at, config_hash) VALUES (?,?)",
+                (now, config_hash),
+            )
+            await self._db.commit()
+            return cursor.lastrowid
 
     async def end_run(self, run_id: int, **stats) -> None:
         now = datetime.now(timezone.utc).isoformat()
@@ -290,10 +298,11 @@ class StateDB:
             sets.append(f"{k}=?")
             params.append(v)
         params.append(run_id)
-        await self._db.execute(
-            f"UPDATE collection_runs SET {','.join(sets)} WHERE id=?", params
-        )
-        await self._db.commit()
+        async with self._write_lock:
+            await self._db.execute(
+                f"UPDATE collection_runs SET {','.join(sets)} WHERE id=?", params
+            )
+            await self._db.commit()
 
     # ── Stats ─────────────────────────────────────────────────
 
@@ -313,4 +322,5 @@ class StateDB:
         return stats
 
     async def commit(self) -> None:
-        await self._db.commit()
+        async with self._write_lock:
+            await self._db.commit()
