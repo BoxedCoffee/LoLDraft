@@ -48,7 +48,8 @@ def load_config(path: str) -> dict:
         sys.exit(1)
 
     for i, k in enumerate(keys):
-        if k.get("key", "").startswith("RGAPI-xxxx"):
+        key = k.get("key", "")
+        if not key or "REPLACE_ME" in key or "xxxx" in key:
             print(f"ERROR: API key {i} is still the placeholder value")
             print("  Replace it with your actual Riot API key from:")
             print("  https://developer.riotgames.com/")

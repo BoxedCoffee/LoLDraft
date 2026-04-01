@@ -54,8 +54,8 @@ pip install -r requirements.txt
 #    Development keys expire every 24 hours.
 #    Production keys are permanent — apply early (free for personal projects).
 
-# 3. Edit config.yaml — add your key(s) and choose regions
-cp config.yaml config.yaml.bak
+# 3. Create config.yaml — add your key(s) and choose regions
+cp config.example.yaml config.yaml
 nano config.yaml
 ```
 

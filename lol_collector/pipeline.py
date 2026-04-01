@@ -155,7 +155,7 @@ class CollectionPipeline:
                 async def _pull_one(player: dict) -> int:
                     async with sem:
                         if self._stop:
-                            return 0, player["puuid"], []
+                            return False, player["puuid"], []
                         try:
                             match_ids = await self.client.get_match_ids(
                                 routing=player["routing"],
@@ -163,7 +163,7 @@ class CollectionPipeline:
                                 queue=self.cfg["collection"]["queue_id"],
                                 count=self.cfg["collection"]["matches_per_player"],
                             )
-                            return len(match_ids), player["puuid"], match_ids
+                            return True, player["puuid"], match_ids
 
                         except Exception as e:
                             logger.error(
@@ -171,16 +171,17 @@ class CollectionPipeline:
                                 player["puuid"][:12],
                                 e,
                             )
-                            return 0, player["puuid"], []
+                            return False, player["puuid"], []
 
                 tasks = [_pull_one(p) for p in players]
                 results = await asyncio.gather(*tasks)
 
                 unique_match_ids: set[str] = set()
-                player_ids: list[str] = []
-                for _, puuid, mids in results:
-                    player_ids.append(puuid)
-                    unique_match_ids.update(mids)
+                succeeded_player_ids: list[str] = []
+                for ok, puuid, mids in results:
+                    if ok:
+                        succeeded_player_ids.append(puuid)
+                        unique_match_ids.update(mids)
 
                 batch_new = 0
                 for mid in unique_match_ids:
@@ -192,7 +193,7 @@ class CollectionPipeline:
                     if is_new:
                         batch_new += 1
 
-                for puuid in player_ids:
+                for puuid in succeeded_player_ids:
                     await self.state.mark_player_matches_pulled(puuid)
 
                 total_new += batch_new
