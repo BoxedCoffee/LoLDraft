@@ -36,7 +36,7 @@ All stored in **Parquet** format (columnar, compressed, fast to query with panda
 
 | Stage | What it does | API calls per item |
 |-------|-------------|-------------------|
-| **1. Discover players** | Pulls Challenger/GM/Master leagues per region | 1 league + 1 summoner lookup per player |
+| **1. Discover players** | Pulls Challenger/GM/Master leagues per region | 1 league per tier |
 | **2. Discover matches** | Pulls match histories per player, deduplicates | 1 per player |
 | **3. Fetch metadata** | Pulls match details, filters by patch/duration | 1 per match |
 | **4. Fetch timelines** | Pulls timeline data for valid matches | 1 per match |

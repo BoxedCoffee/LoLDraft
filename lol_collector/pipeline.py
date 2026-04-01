@@ -79,21 +79,13 @@ class CollectionPipeline:
                     )
 
                     for entry in entries:
-                        summoner_id = entry.get("summonerId", "")
                         lp = entry.get("leaguePoints", 0)
 
-                        if not summoner_id:
-                            continue
-
-                        summoner = await self.client.get_summoner_by_id(
-                            platform, summoner_id
-                        )
-                        if not summoner:
-                            continue
-
-                        puuid = summoner.get("puuid", "")
+                        puuid = entry.get("puuid", "")
                         if not puuid:
                             continue
+
+                        summoner_id = entry.get("summonerId")
 
                         is_new = await self.state.upsert_player(
                             puuid=puuid,
