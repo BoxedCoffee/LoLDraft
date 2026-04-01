@@ -1,0 +1,88 @@
+# LoL Macro Strategy Agent — Data Collection Configuration
+
+# API Keys
+# Each key gets its own rate limiter. More keys = faster collection.
+#
+# key_type: "development" (20 req/s, 100 req/2min)
+#           "production"  (uses custom rate limits below)
+#
+# regions: which regions this key should pull from.
+#          If omitted, the key pulls from ALL configured regions.
+#
+# IMPORTANT: Development keys expire every 24 hours. Production
+# keys are permanent — apply at developer.riotgames.com early.
+
+api_keys:
+  - key: "RGAPI-REPLACE_ME"
+    key_type: "development"
+    # regions: ["na1"]  # optional: restrict to specific regions
+
+  # Uncomment to add more keys:
+  # - key: "RGAPI-yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy"
+  #   key_type: "production"
+  #   rate_limits:
+  #     per_second: 50
+  #     per_two_minutes: 3000
+  #   regions: ["euw1", "kr"]
+
+# Regions
+# Regions to collect from. Each region is an independent pool
+# of players and matches. KR and EUW have the highest quality
+# Masters+ games. NA is smaller but still useful.
+#
+# Available: na1, euw1, kr, eun1, br1, la1, la2, oc1, tr1,
+#            ru, jp1, ph2, sg2, th2, tw2, vn2
+
+regions:
+  - platform: "na1"
+    routing: "americas"    # match-v5 uses routing values, not platform
+  - platform: "euw1"
+    routing: "europe"
+  - platform: "kr"
+    routing: "asia"
+
+# Collection Parameters
+collection:
+  min_tier: "MASTER"
+  queue_id: 420
+  patch_filter: []
+  matches_per_player: 100
+  target_games: 200000
+  min_game_duration: 900
+
+# Rate Limiting
+rate_limits:
+  development:
+    per_second: 20
+    per_two_minutes: 100
+  production:
+    per_second: 50
+    per_two_minutes: 3000
+
+# Retry / Backoff
+retry:
+  max_retries: 5
+  base_delay: 1.0
+  max_delay: 120.0
+  backoff_multiplier: 2.0
+  retry_on_status: [429, 500, 502, 503, 504]
+
+# Storage
+storage:
+  data_dir: "./data"
+  state_db: "./data/collection_state.db"
+  matches_dir: "./data/matches"
+  timelines_dir: "./data/timelines"
+  flush_interval: 500
+
+# Concurrency
+concurrency:
+  max_concurrent_per_key: 10
+  max_concurrent_writes: 2
+
+# Logging
+logging:
+  level: "INFO"
+  log_file: "./data/collector.log"
+  console: true
+  progress_bar: true

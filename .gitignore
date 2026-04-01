@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+
+lol_collector/data/
+*.db
+*.db-wal
+*.db-shm
+*.log
+
+lol_collector/config.yaml
+
+5mLoLGames/
+backups/
+
+*.zip
+
