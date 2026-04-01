@@ -79,9 +79,19 @@ class CollectionPipeline:
                     )
 
                     for entry in entries:
+                        summoner_id = entry.get("summonerId", "")
                         lp = entry.get("leaguePoints", 0)
 
-                        puuid = entry.get("puuid", "")
+                        if not summoner_id:
+                            continue
+
+                        summoner = await self.client.get_summoner_by_id(
+                            platform, summoner_id
+                        )
+                        if not summoner:
+                            continue
+
+                        puuid = summoner.get("puuid", "")
                         if not puuid:
                             continue
 
@@ -89,6 +99,7 @@ class CollectionPipeline:
                             puuid=puuid,
                             platform=platform,
                             routing=routing,
+                            summoner_id=summoner_id,
                             tier=tier,
                             lp=lp,
                         )

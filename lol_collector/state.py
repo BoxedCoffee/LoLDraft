@@ -180,51 +180,51 @@ class StateDB:
     ) -> bool:
         """Insert or update a match. Returns True if newly inserted."""
         now = datetime.now(timezone.utc).isoformat()
-        try:
-            cursor = await self._db.execute(
-                """INSERT OR IGNORE INTO matches
-                   (match_id, platform, routing, status, game_version,
-                    game_duration, queue_id, discovered_at, updated_at)
-                   VALUES (?,?,?,?,?,?,?,?,?)""",
-                (
-                    match_id,
-                    platform,
-                    routing,
-                    int(status),
-                    game_version,
-                    game_duration,
-                    queue_id,
-                    now,
-                    now,
-                ),
-            )
-        except aiosqlite.IntegrityError:
-            cursor = None
-
-        inserted = bool(getattr(cursor, "rowcount", 0))
-        if inserted:
-            return True
-
-        updates = ["updated_at=?"]
-        params = [now]
-        if game_version:
-            updates.append("game_version=?")
-            params.append(game_version)
-        if game_duration is not None:
-            updates.append("game_duration=?")
-            params.append(game_duration)
-        if queue_id is not None:
-            updates.append("queue_id=?")
-            params.append(queue_id)
-        if status != MatchStatus.DISCOVERED:
-            updates.append("status=?")
-            params.append(int(status))
-        params.append(match_id)
-        await self._db.execute(
-            f"UPDATE matches SET {','.join(updates)} WHERE match_id=?",
-            params,
+        cursor = await self._db.execute(
+            "SELECT match_id FROM matches WHERE match_id = ?", (match_id,)
         )
-        return False
+        existing = await cursor.fetchone()
+
+        if existing:
+            updates = ["updated_at=?"]
+            params = [now]
+            if game_version:
+                updates.append("game_version=?")
+                params.append(game_version)
+            if game_duration is not None:
+                updates.append("game_duration=?")
+                params.append(game_duration)
+            if queue_id is not None:
+                updates.append("queue_id=?")
+                params.append(queue_id)
+            if status != MatchStatus.DISCOVERED:
+                updates.append("status=?")
+                params.append(int(status))
+            params.append(match_id)
+            await self._db.execute(
+                f"UPDATE matches SET {','.join(updates)} WHERE match_id=?",
+                params,
+            )
+            return False
+
+        await self._db.execute(
+            """INSERT INTO matches
+               (match_id, platform, routing, status, game_version,
+                game_duration, queue_id, discovered_at, updated_at)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
+            (
+                match_id,
+                platform,
+                routing,
+                int(status),
+                game_version,
+                game_duration,
+                queue_id,
+                now,
+                now,
+            ),
+        )
+        return True
 
     async def update_match_status(
         self, match_id: str, status: MatchStatus, **kwargs
