@@ -1,44 +1,38 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-- `lol_collector/`: Python data-collection pipeline (CLI + orchestration).
-  - `collect.py`: main entrypoint (`--stage`, `--stats`, `--config`).
-  - `pipeline.py`: stage orchestration.
-  - `riot_api.py`: async HTTP client for Riot endpoints.
-  - `rate_limiter.py`: per-key dual-window limiter + 429 cooldown.
-  - `state.py`: SQLite checkpointing/resume state.
-  - `export.py`: Parquet writers/output layout.
-- `lol_collector/config.yaml`: runtime configuration (API keys, regions, limits).
-- `5mLoLGames/` and `*.csv`: sample/processed datasets (treat as data artifacts).
-- `backups/`: archived snapshots.
+- `lol_collector/`: Python data-collection pipeline.
+  - `collect.py`: CLI entrypoint (`--stage`, `--stats`, `--config`).
+  - `pipeline.py`: orchestrates the 4-stage flow.
+  - `riot_api.py`: async Riot API client (aiohttp).
+  - `rate_limiter.py`: per-key rate limits + 429 cooldown.
+  - `state.py`: SQLite checkpointing/resume.
+  - `export.py`: Parquet output writers.
+- `lol_collector/data/`: local output (Parquet + `collection_state.db`). Treat as artifacts.
+- `lol_collector/config.example.yaml`: template config; copy to `config.yaml` locally.
 
 ## Build, Test, and Development Commands
-Run from `lol_collector/`.
-- `pip install -r requirements.txt`: install runtime dependencies.
-- `python collect.py`: run the full 4-stage pipeline.
-- `python collect.py --stage players|matches|metadata|timelines`: run one stage.
-- `python collect.py --stats`: print progress from the SQLite state DB.
-- `python collect.py --config production.yaml`: use an alternate config file.
+Run from `lol_collector/`:
+- `pip install -r requirements.txt`: install dependencies.
+- `python collect.py`: run the full pipeline (players → matches → metadata → timelines).
+- `python collect.py --stage players|matches|metadata|timelines`: run a single stage.
+- `python collect.py --stats`: show progress from the SQLite state DB.
+- `python collect.py --config <file>.yaml`: run with an alternate config.
 
 ## Coding Style & Naming Conventions
-- Language: Python 3 (asyncio/aiohttp).
-- Indentation: 4 spaces; keep functions small and single-purpose.
-- Naming: `snake_case` for functions/vars, `PascalCase` for classes, constants in `UPPER_SNAKE_CASE`.
-- Prefer explicit types where practical (e.g., type hints on public functions) and clear docstrings for pipeline stages.
+- Python: 4-space indentation; prefer small, single-purpose functions.
+- Naming: `snake_case` (functions/vars), `PascalCase` (classes), `UPPER_SNAKE_CASE` (constants).
+- Keep I/O boundaries clear: API code in `riot_api.py`, persistence in `state.py`, transforms/writes in `export.py`.
 
 ## Testing Guidelines
-No dedicated test suite is currently present. When adding tests:
-- Use `pytest` and place tests under `lol_collector/tests/`.
-- Name files `test_*.py` and keep fixtures local and deterministic.
-- Avoid live Riot API calls in CI; mock HTTP (e.g., `aioresponses`) and use small JSON fixtures.
+No dedicated test suite is present yet. If you add tests:
+- Use `pytest` under `lol_collector/tests/` with `test_*.py` naming.
+- Avoid live Riot calls; mock HTTP (e.g., `aioresponses`) and use small JSON fixtures.
 
 ## Commit & Pull Request Guidelines
-- Commits: use imperative, scoped messages when possible (e.g., `collector: handle 429 Retry-After`), and keep commits focused.
-- PRs should include:
-  - A clear description of the change and rationale.
-  - Config/data impact notes (e.g., schema changes to Parquet output).
-  - Steps to validate locally (exact commands run).
+- Commits: use imperative, scoped messages when possible (e.g., `collector: handle Retry-After`).
+- PRs should include: summary + rationale, how to validate (exact commands), and data/schema impact notes (Parquet columns, state DB migrations).
 
 ## Security & Configuration Tips
-- Never commit real Riot API keys. Keep keys in `config.yaml` locally and redact in examples.
-- Treat `data/collection_state.db` as stateful; deleting it resets progress.
+- Never commit real Riot API keys. Keep `lol_collector/config.yaml` local and redact logs/examples.
+- Do not delete `lol_collector/data/collection_state.db` unless you intend to reset progress.

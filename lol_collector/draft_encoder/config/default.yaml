@@ -1,0 +1,21 @@
+# Draft Encoder — Default Training Configuration
+
+data_dir: "./data/processed"
+device: "cuda"  # "cuda" or "cpu"
+checkpoint_dir: "./checkpoints"
+
+model:
+  champion_dim: 64
+  draft_dim: 256
+  patch_dim: 16
+  team_hidden: 512
+  num_team_layers: 3
+  dropout: 0.1
+
+training:
+  batch_size: 512
+  learning_rate: 3.0e-4
+  weight_decay: 0.01
+  max_epochs: 100
+  patience: 10
+  warmup_steps: 1000

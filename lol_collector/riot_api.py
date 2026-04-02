@@ -1,13 +1,4 @@
-"""
-Async Riot Games API client.
-
-Handles:
-  - Multi-key request routing via MultiKeyLimiter
-  - Exponential backoff with jitter on retries
-  - 429 Retry-After header respect
-  - Region-aware endpoint construction
-  - Optional key→region affinity
-"""
+"""Async Riot Games API client."""
 
 import asyncio
 import logging
@@ -45,30 +36,18 @@ class RiotAPIError(Exception):
 
 
 class RiotClient:
-    """
-    Async Riot API client with multi-key support.
-
-    Usage:
-        async with RiotClient(limiter, retry_cfg) as client:
-            data = await client.get_league_entries("na1", "MASTER")
-    """
-
     def __init__(
         self,
         limiter: MultiKeyLimiter,
         retry_config: RetryConfig = RetryConfig(),
         key_region_map: Optional[dict[str, list[str]]] = None,
-        max_in_flight: int = 8,
     ):
         self._limiter = limiter
         self._retry = retry_config
         self._session: Optional[aiohttp.ClientSession] = None
-        # key_id -> list of platform IDs this key should serve
-        # None means any key can serve any region
         self._key_region_map = key_region_map or {}
         self._request_count = 0
         self._error_count = 0
-        self._in_flight = asyncio.Semaphore(max(1, int(max_in_flight)))
 
     async def __aenter__(self):
         timeout = aiohttp.ClientTimeout(total=30, connect=10)
@@ -81,93 +60,71 @@ class RiotClient:
 
     @property
     def stats(self) -> dict:
-        return {
-            "requests": self._request_count,
-            "errors": self._error_count,
-        }
+        return {"requests": self._request_count, "errors": self._error_count}
 
     def _pick_key_for_region(self, platform: str) -> Optional[str]:
-        """If key-region affinity is configured, pick an appropriate key."""
         candidates = []
         for key_id, regions in self._key_region_map.items():
             if platform in regions:
                 candidates.append(key_id)
-        if not candidates:
-            # No affinity configured, or this region has no assigned key
-            return None
         return candidates[0] if len(candidates) == 1 else None
 
-    async def _request(
-        self, url: str, preferred_key: Optional[str] = None
-    ) -> Any:
-        """
-        Make a rate-limited, retried GET request.
-
-        Returns parsed JSON or raises RiotAPIError.
-        """
+    async def _request(self, url: str, preferred_key: Optional[str] = None) -> Any:
         last_exc = None
 
         for attempt in range(self._retry.max_retries + 1):
-            # Acquire a key
-            if preferred_key:
-                limiter = self._limiter.get_limiter(preferred_key)
-                await limiter.acquire()
-                key_id = preferred_key
-            else:
-                key_id, _ = await self._limiter.acquire_best()
-
-            api_key = self._limiter.get_api_key(key_id)
-            headers = {"X-Riot-Token": api_key}
-
+            key_id: Optional[str] = None
             try:
+                if preferred_key:
+                    await self._limiter.acquire_preferred(preferred_key)
+                    key_id = preferred_key
+                else:
+                    key_id, _ = await self._limiter.acquire_best()
+
+                api_key = self._limiter.get_api_key(key_id)
+                headers = {"X-Riot-Token": api_key}
+
                 self._request_count += 1
-                async with self._in_flight:
-                    async with self._session.get(url, headers=headers) as resp:
-                        if resp.status == 200:
-                            return await resp.json()
+                async with self._session.get(url, headers=headers) as resp:
+                    if resp.status == 200:
+                        return await resp.json()
 
-                        if resp.status == 429:
-                            retry_after = float(
-                                resp.headers.get("Retry-After", "5")
-                            )
-                            self._limiter.report_429(key_id, retry_after)
-                            logger.warning(
-                                "429 on key %s — backing off %.1fs (attempt %d/%d)",
-                                key_id[:12],
-                                retry_after,
-                                attempt + 1,
-                                self._retry.max_retries,
-                            )
-                            self._error_count += 1
-                            await asyncio.sleep(retry_after)
-                            continue
+                    if resp.status == 429:
+                        retry_after = float(resp.headers.get("Retry-After", "5"))
+                        self._limiter.report_429(key_id, retry_after)
+                        logger.warning(
+                            "429 on key %s - backing off %.0fs (attempt %d/%d)",
+                            key_id[:8],
+                            retry_after,
+                            attempt + 1,
+                            self._retry.max_retries,
+                        )
+                        self._error_count += 1
+                        await asyncio.sleep(retry_after)
+                        continue
 
-                        if resp.status == 404:
-                            return None
+                    if resp.status == 404:
+                        return None
 
-                        if resp.status == 403:
-                            body = await resp.text()
-                            logger.error(
-                                "403 Forbidden on key %s — key may be expired: %s",
-                                key_id[:12],
-                                body[:200],
-                            )
-                            raise RiotAPIError(403, body[:200], url)
+                    if resp.status == 403:
+                        body = await resp.text()
+                        logger.error("403 on key %s - may be expired: %s", key_id[:8], body[:200])
+                        raise RiotAPIError(403, body[:200], url)
 
-                        if resp.status in self._retry.retry_on_status:
-                            self._error_count += 1
-                            body = await resp.text()
-                            last_exc = RiotAPIError(resp.status, body[:200], url)
-                            logger.warning(
-                                "HTTP %d on %s (attempt %d/%d)",
-                                resp.status,
-                                url,
-                                attempt + 1,
-                                self._retry.max_retries,
-                            )
-                        else:
-                            body = await resp.text()
-                            raise RiotAPIError(resp.status, body[:200], url)
+                    if resp.status in self._retry.retry_on_status:
+                        self._error_count += 1
+                        body = await resp.text()
+                        last_exc = RiotAPIError(resp.status, body[:200], url)
+                        logger.warning(
+                            "HTTP %d on %s (attempt %d/%d)",
+                            resp.status,
+                            url,
+                            attempt + 1,
+                            self._retry.max_retries,
+                        )
+                    else:
+                        body = await resp.text()
+                        raise RiotAPIError(resp.status, body[:200], url)
 
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                 self._error_count += 1
@@ -179,6 +136,9 @@ class RiotClient:
                     self._retry.max_retries,
                     str(e)[:100],
                 )
+            finally:
+                if key_id is not None:
+                    self._limiter.release()
 
             # Exponential backoff with jitter
             delay = min(

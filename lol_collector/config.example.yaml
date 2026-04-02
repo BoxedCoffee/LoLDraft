@@ -13,7 +13,7 @@
 # keys are permanent — apply at developer.riotgames.com early.
 
 api_keys:
-  - key: "RGAPI-REPLACE_ME"
+  - key: "RGAPI-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
     key_type: "development"
     # regions: ["na1"]  # optional: restrict to specific regions
 
@@ -52,7 +52,6 @@ collection:
 
 # Rate Limiting
 rate_limits:
-  safety_margin: 0.8
   development:
     per_second: 20
     per_two_minutes: 100
@@ -78,7 +77,6 @@ storage:
 
 # Concurrency
 concurrency:
-  max_in_flight: 8
   max_concurrent_per_key: 10
   max_concurrent_writes: 2
 

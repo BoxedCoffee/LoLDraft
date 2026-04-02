@@ -1,22 +1,10 @@
-"""
-Collection pipeline orchestrator.
-
-Stages:
-  1. Discover players — pull Master/GM/Challenger leagues per region
-  2. Discover matches — pull match histories per player, deduplicate
-  3. Fetch metadata  — pull match details, filter by patch/duration
-  4. Fetch timelines — pull timeline data for valid matches
-  5. Export          — flush to Parquet
-
-Each stage is resumable — checkpointed via StateDB.
-"""
+"""Collection pipeline orchestrator."""
 
 import asyncio
 import logging
 from typing import Optional
 
 from tqdm import tqdm
-from tqdm.asyncio import tqdm as atqdm
 
 from riot_api import RiotClient
 from state import StateDB, MatchStatus
@@ -42,17 +30,12 @@ class CollectionPipeline:
         self._stop = False
 
     def request_stop(self):
-        """Signal graceful shutdown."""
         self._stop = True
         logger.info("Graceful shutdown requested...")
 
     # ── Stage 1: Discover Players ─────────────────────────────
 
     async def discover_players(self) -> int:
-        """
-        Pull high-elo player lists from all configured regions.
-        Returns total new players discovered.
-        """
         total_new = 0
 
         for region in self.regions:
@@ -79,13 +62,16 @@ class CollectionPipeline:
                     )
 
                     for entry in entries:
+                        summoner_id = entry.get("summonerId", "")
                         lp = entry.get("leaguePoints", 0)
 
-                        puuid = entry.get("puuid", "")
-                        if not puuid:
+                        summoner = await self.client.get_summoner_by_id(platform, summoner_id)
+                        if not summoner:
                             continue
 
-                        summoner_id = entry.get("summonerId")
+                        puuid = summoner.get("puuid", "")
+                        if not puuid:
+                            continue
 
                         is_new = await self.state.upsert_player(
                             puuid=puuid,
@@ -114,10 +100,6 @@ class CollectionPipeline:
         batch_size: int = 50,
         concurrency: int = 5,
     ) -> int:
-        """
-        Pull match histories for all undiscovered players.
-        Returns total new match IDs found.
-        """
         total_new = 0
         sem = asyncio.Semaphore(concurrency)
 
@@ -144,10 +126,13 @@ class CollectionPipeline:
                     platform.upper(),
                 )
 
-                async def _pull_one(player: dict) -> int:
+                all_match_ids: list[str] = []
+                pulled_puuids: list[str] = []
+
+                async def _pull_one(player: dict) -> list[str]:
                     async with sem:
                         if self._stop:
-                            return False, player["puuid"], []
+                            return []
                         try:
                             match_ids = await self.client.get_match_ids(
                                 routing=player["routing"],
@@ -155,7 +140,8 @@ class CollectionPipeline:
                                 queue=self.cfg["collection"]["queue_id"],
                                 count=self.cfg["collection"]["matches_per_player"],
                             )
-                            return True, player["puuid"], match_ids
+                            pulled_puuids.append(player["puuid"])
+                            return match_ids
 
                         except Exception as e:
                             logger.error(
@@ -163,29 +149,20 @@ class CollectionPipeline:
                                 player["puuid"][:12],
                                 e,
                             )
-                            return False, player["puuid"], []
+                            return []
 
                 tasks = [_pull_one(p) for p in players]
                 results = await asyncio.gather(*tasks)
 
-                unique_match_ids: set[str] = set()
-                succeeded_player_ids: list[str] = []
-                for ok, puuid, mids in results:
-                    if ok:
-                        succeeded_player_ids.append(puuid)
-                        unique_match_ids.update(mids)
+                for match_ids in results:
+                    all_match_ids.extend(match_ids)
 
-                batch_new = 0
-                for mid in unique_match_ids:
-                    is_new = await self.state.upsert_match(
-                        match_id=mid,
-                        platform=platform,
-                        routing=routing,
-                    )
-                    if is_new:
-                        batch_new += 1
+                if all_match_ids:
+                    batch_new = await self.state.batch_upsert_matches(all_match_ids, platform, routing)
+                else:
+                    batch_new = 0
 
-                for puuid in succeeded_player_ids:
+                for puuid in pulled_puuids:
                     await self.state.mark_player_matches_pulled(puuid)
 
                 total_new += batch_new
@@ -205,7 +182,7 @@ class CollectionPipeline:
     async def fetch_metadata(
         self,
         batch_size: int = 200,
-        concurrency: int = 10,
+        concurrency: int = 5,
     ) -> int:
         """
         Fetch match details for all DISCOVERED matches.
@@ -338,7 +315,7 @@ class CollectionPipeline:
     async def fetch_timelines(
         self,
         batch_size: int = 200,
-        concurrency: int = 10,
+        concurrency: int = 5,
     ) -> int:
         """
         Fetch timelines for all matches with METADATA_DONE status.

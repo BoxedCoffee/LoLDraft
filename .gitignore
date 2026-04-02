@@ -9,8 +9,15 @@ lol_collector/data/
 
 lol_collector/config.yaml
 
+lol_collector/draft_encoder/checkpoints/
+lol_collector/draft_encoder/eval_output/
+lol_collector/draft_encoder/kaggle_data/
+lol_collector/draft_encoder/champion_vocab.json
+lol_collector/draft_encoder/splits.json
+
 5mLoLGames/
 backups/
 
-*.zip
+_incoming/
 
+*.zip

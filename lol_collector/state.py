@@ -278,6 +278,21 @@ class StateDB:
         row = await cursor.fetchone()
         return row[0]
 
+    async def batch_upsert_matches(self, match_ids: list[str], platform: str, routing: str) -> int:
+        now = datetime.now(timezone.utc).isoformat()
+        inserted = 0
+        async with self._write_lock:
+            for match_id in match_ids:
+                cursor = await self._db.execute(
+                    """INSERT OR IGNORE INTO matches
+                       (match_id, platform, routing, status, discovered_at, updated_at)
+                       VALUES (?,?,?,0,?,?)""",
+                    (match_id, platform, routing, now, now),
+                )
+                if cursor.rowcount == 1:
+                    inserted += 1
+        return inserted
+
     # ── Runs ──────────────────────────────────────────────────
 
     async def start_run(self, config_hash: str = None) -> int:

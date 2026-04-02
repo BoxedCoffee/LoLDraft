@@ -36,7 +36,7 @@ All stored in **Parquet** format (columnar, compressed, fast to query with panda
 
 | Stage | What it does | API calls per item |
 |-------|-------------|-------------------|
-| **1. Discover players** | Pulls Challenger/GM/Master leagues per region | 1 league per tier |
+| **1. Discover players** | Pulls Challenger/GM/Master leagues per region | 1 league + 1 summoner lookup per player |
 | **2. Discover matches** | Pulls match histories per player, deduplicates | 1 per player |
 | **3. Fetch metadata** | Pulls match details, filters by patch/duration | 1 per match |
 | **4. Fetch timelines** | Pulls timeline data for valid matches | 1 per match |
@@ -54,8 +54,8 @@ pip install -r requirements.txt
 #    Development keys expire every 24 hours.
 #    Production keys are permanent — apply early (free for personal projects).
 
-# 3. Create config.yaml — add your key(s) and choose regions
-cp config.example.yaml config.yaml
+# 3. Edit config.yaml — add your key(s) and choose regions
+cp config.yaml config.yaml.bak
 nano config.yaml
 ```
 

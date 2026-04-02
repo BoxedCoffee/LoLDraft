@@ -49,7 +49,7 @@ def load_config(path: str) -> dict:
 
     for i, k in enumerate(keys):
         key = k.get("key", "")
-        if not key or "REPLACE_ME" in key or "xxxx" in key:
+        if not key or "REPLACE_ME" in key or key.startswith("RGAPI-xxxx"):
             print(f"ERROR: API key {i} is still the placeholder value")
             print("  Replace it with your actual Riot API key from:")
             print("  https://developer.riotgames.com/")
@@ -107,9 +107,11 @@ def setup_logging(cfg: dict) -> None:
 
 def build_limiter(cfg: dict) -> MultiKeyLimiter:
     """Build multi-key rate limiter from config."""
-    limiter = MultiKeyLimiter()
+    concurrency = cfg.get("concurrency", {}).get("max_concurrent_per_key", 10)
+    total_concurrency = concurrency * len(cfg.get("api_keys", []))
+    max_in_flight = cfg.get("concurrency", {}).get("max_in_flight", min(8, total_concurrency or 1))
+    limiter = MultiKeyLimiter(max_total_concurrent=max_in_flight)
     rate_defaults = cfg.get("rate_limits", {})
-    safety_margin = rate_defaults.get("safety_margin", 0.8)
 
     for i, key_cfg in enumerate(cfg["api_keys"]):
         key_id = f"key_{i}"
@@ -130,7 +132,7 @@ def build_limiter(cfg: dict) -> MultiKeyLimiter:
             per_s = rate_defaults.get("development", {}).get("per_second", 20)
             per_2m = rate_defaults.get("development", {}).get("per_two_minutes", 100)
 
-        limiter.add_key(key_id, api_key, per_s, per_2m, safety_margin=safety_margin)
+        limiter.add_key(key_id, api_key, per_s, per_2m)
         logger.info(
             "Registered key %s (%s): %d/s, %d/2min",
             key_id,
@@ -207,9 +209,8 @@ async def run(cfg: dict, stage: str = None) -> None:
 
     concurrency = cfg.get("concurrency", {}).get("max_concurrent_per_key", 10)
     total_concurrency = concurrency * len(cfg["api_keys"])
-    max_in_flight = cfg.get("concurrency", {}).get("max_in_flight", min(8, total_concurrency))
 
-    async with RiotClient(limiter, retry_cfg, key_region_map, max_in_flight=max_in_flight) as client:
+    async with RiotClient(limiter, retry_cfg, key_region_map) as client:
         pipeline = CollectionPipeline(
             client=client,
             state=state,
