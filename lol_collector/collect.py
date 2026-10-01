@@ -171,15 +171,16 @@ async def print_stats(cfg: dict) -> None:
     print(f"  Awaiting metadata:   {stats['discovered']:>8,}")
     print(f"  Metadata done:       {stats['metadata_done']:>8,}")
     print(f"  Timelines done:      {stats['timeline_done']:>8,}")
-    print(f"  Complete:            {stats['complete']:>8,}")
+    if stats["timeline_done"] != stats["complete"]:
+        print(f"  Complete:            {stats['complete']:>8,}")
     print(f"  Skipped:             {stats['skipped']:>8,}")
     print(f"  Failed:              {stats['failed']:>8,}")
     print("=" * 50)
 
     target = cfg["collection"].get("target_games", 200000)
-    complete = stats["complete"]
-    pct = (complete / target * 100) if target > 0 else 0
-    print(f"  Progress: {complete:,} / {target:,} ({pct:.1f}%)")
+    timelines_done = stats["timeline_done"]
+    pct = (timelines_done / target * 100) if target > 0 else 0
+    print(f"  Progress: {timelines_done:,} / {target:,} ({pct:.1f}%)")
     print("=" * 50 + "\n")
 
 
@@ -257,6 +258,8 @@ async def run(cfg: dict, stage: str = None) -> None:
                     await pipeline.fetch_metadata(concurrency=total_concurrency)
                 elif stage == "timelines":
                     await pipeline.fetch_timelines(concurrency=total_concurrency)
+                elif stage == "reconcile":
+                    await pipeline.reconcile_timelines(concurrency=total_concurrency)
                 else:
                     logger.error("Unknown stage: %s", stage)
             else:
@@ -293,7 +296,7 @@ Examples:
   python collect.py --stats             Show collection progress
   python collect.py --config prod.yaml  Use production config
 
-Stages: players, matches, metadata, timelines
+Stages: players, matches, metadata, timelines, reconcile
         """,
     )
     parser.add_argument(
@@ -303,7 +306,7 @@ Stages: players, matches, metadata, timelines
     )
     parser.add_argument(
         "--stage",
-        choices=["players", "matches", "metadata", "timelines"],
+        choices=["players", "matches", "metadata", "timelines", "reconcile"],
         help="Run a specific pipeline stage instead of the full pipeline",
     )
     parser.add_argument(

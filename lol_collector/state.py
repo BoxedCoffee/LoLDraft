@@ -12,6 +12,7 @@ All operations are async via aiosqlite.
 
 import asyncio
 import logging
+import sqlite3
 from datetime import datetime, timezone
 from enum import IntEnum
 from typing import Optional
@@ -80,8 +81,20 @@ class StateDB:
         self._db: Optional[aiosqlite.Connection] = None
         self._write_lock = asyncio.Lock()
 
+    async def _execute_with_retry(self, sql: str, parameters: tuple = ()):
+        delay = 0.1
+        for _ in range(10):
+            try:
+                return await self._db.execute(sql, parameters)
+            except sqlite3.OperationalError as e:
+                if "database is locked" not in str(e).lower():
+                    raise
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 2.0)
+        return await self._db.execute(sql, parameters)
+
     async def connect(self) -> None:
-        self._db = await aiosqlite.connect(self._db_path)
+        self._db = await aiosqlite.connect(self._db_path, timeout=30)
         self._db.row_factory = aiosqlite.Row
         await self._db.execute("PRAGMA journal_mode=WAL")
         await self._db.execute("PRAGMA synchronous=NORMAL")
@@ -109,7 +122,7 @@ class StateDB:
         """Insert or update a player. Returns True if newly inserted."""
         now = datetime.now(timezone.utc).isoformat()
         async with self._write_lock:
-            cursor = await self._db.execute(
+            cursor = await self._execute_with_retry(
                 "SELECT puuid FROM players WHERE puuid = ?", (puuid,)
             )
             existing = await cursor.fetchone()
@@ -123,7 +136,7 @@ class StateDB:
                 )
                 return False
 
-            await self._db.execute(
+            await self._execute_with_retry(
                 """INSERT INTO players
                    (puuid, platform, routing, summoner_id, tier, lp,
                     discovered_at, updated_at)
@@ -156,7 +169,7 @@ class StateDB:
     async def mark_player_matches_pulled(self, puuid: str) -> None:
         now = datetime.now(timezone.utc).isoformat()
         async with self._write_lock:
-            await self._db.execute(
+            await self._execute_with_retry(
                 "UPDATE players SET matches_pulled=1, updated_at=? WHERE puuid=?",
                 (now, puuid),
             )
@@ -186,7 +199,7 @@ class StateDB:
         """Insert or update a match. Returns True if newly inserted."""
         now = datetime.now(timezone.utc).isoformat()
         async with self._write_lock:
-            cursor = await self._db.execute(
+            cursor = await self._execute_with_retry(
                 "SELECT match_id FROM matches WHERE match_id = ?", (match_id,)
             )
             existing = await cursor.fetchone()
@@ -213,7 +226,7 @@ class StateDB:
                 )
                 return False
 
-            await self._db.execute(
+            await self._execute_with_retry(
                 """INSERT INTO matches
                    (match_id, platform, routing, status, game_version,
                     game_duration, queue_id, discovered_at, updated_at)
@@ -243,7 +256,7 @@ class StateDB:
             params.append(v)
         params.append(match_id)
         async with self._write_lock:
-            await self._db.execute(
+            await self._execute_with_retry(
                 f"UPDATE matches SET {','.join(sets)} WHERE match_id=?", params
             )
 
@@ -283,7 +296,7 @@ class StateDB:
         inserted = 0
         async with self._write_lock:
             for match_id in match_ids:
-                cursor = await self._db.execute(
+                cursor = await self._execute_with_retry(
                     """INSERT OR IGNORE INTO matches
                        (match_id, platform, routing, status, discovered_at, updated_at)
                        VALUES (?,?,?,0,?,?)""",
@@ -298,7 +311,7 @@ class StateDB:
     async def start_run(self, config_hash: str = None) -> int:
         now = datetime.now(timezone.utc).isoformat()
         async with self._write_lock:
-            cursor = await self._db.execute(
+            cursor = await self._execute_with_retry(
                 "INSERT INTO collection_runs (started_at, config_hash) VALUES (?,?)",
                 (now, config_hash),
             )
@@ -314,7 +327,7 @@ class StateDB:
             params.append(v)
         params.append(run_id)
         async with self._write_lock:
-            await self._db.execute(
+            await self._execute_with_retry(
                 f"UPDATE collection_runs SET {','.join(sets)} WHERE id=?", params
             )
             await self._db.commit()
@@ -322,16 +335,17 @@ class StateDB:
     # ── Stats ─────────────────────────────────────────────────
 
     async def get_stats(self) -> dict:
-        stats = {}
-        for label, status in [
-            ("discovered", MatchStatus.DISCOVERED),
-            ("metadata_done", MatchStatus.METADATA_DONE),
-            ("timeline_done", MatchStatus.TIMELINE_DONE),
-            ("complete", MatchStatus.COMPLETE),
-            ("skipped", MatchStatus.SKIPPED),
-            ("failed", MatchStatus.FAILED),
-        ]:
-            stats[label] = await self.match_count(status)
+        stats = {
+            "discovered": await self.match_count(MatchStatus.DISCOVERED),
+            "metadata_done": await self.match_count(MatchStatus.METADATA_DONE),
+            "complete": await self.match_count(MatchStatus.COMPLETE),
+            "skipped": await self.match_count(MatchStatus.SKIPPED),
+            "failed": await self.match_count(MatchStatus.FAILED),
+        }
+
+        stats["timeline_done"] = stats["complete"] + await self.match_count(
+            MatchStatus.TIMELINE_DONE
+        )
         stats["total_matches"] = await self.match_count()
         stats["total_players"] = await self.player_count()
         return stats

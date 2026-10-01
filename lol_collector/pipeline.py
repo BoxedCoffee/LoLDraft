@@ -4,6 +4,8 @@ import asyncio
 import logging
 from typing import Optional
 
+import pyarrow.compute as pc
+import pyarrow.dataset as ds
 from tqdm import tqdm
 
 from riot_api import RiotClient
@@ -421,6 +423,109 @@ class CollectionPipeline:
 
         self.exporter.flush_remaining()
         logger.info("Timeline fetch complete: %d new timelines", total_done)
+        return total_done
+
+    # ── Stage 4b: Reconcile Timelines (Prefer COMPLETE) ───────
+
+    async def reconcile_timelines(
+        self,
+        batch_size: int = 5000,
+        concurrency: int = 5,
+    ) -> int:
+        """Backfill timelines for matches that have metadata but are missing timeline parquet.
+
+        Invariant: Prefer COMPLETE. We do not touch FAILED/SKIPPED; we only work from
+        the natural queue of matches in METADATA_DONE.
+
+        Returns the number of newly completed matches.
+        """
+
+        # Build a set of match_ids that already have timeline parquet rows.
+        timeline_files = ds.dataset(
+            "./data/timelines",
+            format="parquet",
+            exclude_invalid_files=True,
+        )
+        timeline_ids = set(
+            pc.unique(timeline_files.to_table(columns=["match_id"])["match_id"]).to_pylist()
+        )
+
+        logger.info("Reconcile: timeline parquet match_ids: %d", len(timeline_ids))
+
+        sem = asyncio.Semaphore(concurrency)
+        total_done = 0
+
+        while True:
+            if self._stop:
+                break
+
+            matches = await self.state.get_matches_by_status(
+                MatchStatus.METADATA_DONE, limit=batch_size
+            )
+            if not matches:
+                break
+
+            missing = [m for m in matches if m["match_id"] not in timeline_ids]
+            if not missing:
+                # We might have more METADATA_DONE in DB than we can scan in one batch.
+                # If this batch is fully covered, continue scanning next batch.
+                logger.info("Reconcile: batch has no missing timelines (%d checked)", len(matches))
+                continue
+
+            logger.info(
+                "Reconcile: %d/%d matches missing timelines in this batch",
+                len(missing),
+                len(matches),
+            )
+
+            pbar = tqdm(
+                total=len(missing),
+                desc="Reconciling timelines",
+                unit="tl",
+                leave=False,
+            )
+
+            async def _fetch_one(match: dict) -> bool:
+                async with sem:
+                    if self._stop:
+                        return False
+                    try:
+                        data = await self.client.get_timeline(match["routing"], match["match_id"])
+                        pbar.update(1)
+
+                        if data is None:
+                            return False
+
+                        # Abort early if the API key is invalid/expired to avoid hammering 401s.
+                        if isinstance(data, dict) and data.get("status", {}).get("status_code") == 401:
+                            raise RuntimeError(f"Riot API 401: {data.get('status', {}).get('message')}")
+
+                        success = self.exporter.add_timeline(match["match_id"], data)
+                        if success:
+                            await self.state.update_match_status(match["match_id"], MatchStatus.COMPLETE)
+                            timeline_ids.add(match["match_id"])
+                            return True
+                        return False
+
+                    except Exception as e:
+                        logger.error("Error reconciling timeline %s: %s", match["match_id"], e)
+                        return False
+
+            results = await asyncio.gather(*[_fetch_one(m) for m in missing])
+            pbar.close()
+
+            batch_done = sum(1 for r in results if r)
+            total_done += batch_done
+
+            if self.exporter.should_flush():
+                self.exporter.flush()
+
+            await self.state.commit()
+
+            logger.info("Reconcile batch: %d completed", batch_done)
+
+        self.exporter.flush_remaining()
+        logger.info("Reconcile complete: %d newly completed", total_done)
         return total_done
 
     # ── Full Pipeline Run ─────────────────────────────────────

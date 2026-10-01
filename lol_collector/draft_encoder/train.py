@@ -166,11 +166,24 @@ def main():
     weight_decay = train_cfg.get("weight_decay", 0.01)
     max_epochs = train_cfg.get("max_epochs", 100)
     patience = train_cfg.get("patience", 10)
+    num_workers = train_cfg.get("num_workers", 4)
+    pin_memory = device.type == "cuda"
 
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
-                              num_workers=4, pin_memory=True, drop_last=True)
-    val_loader = DataLoader(val_ds, batch_size=batch_size * 2, shuffle=False,
-                            num_workers=4, pin_memory=True)
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        drop_last=True,
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=batch_size * 2,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+    )
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
 
