@@ -100,7 +100,7 @@ def build_drafts(participants: pd.DataFrame, matches: pd.DataFrame) -> tuple[pd.
     # keep the first (this handles rare data issues)
     valid = valid.drop_duplicates(subset=["match_id", "team_id", "norm_role"], keep="first")
 
-    # Build champion vocab
+    # Build champion vocab - mapping champion names to IDs
     all_champions = sorted(valid["champion"].dropna().unique())
     champion_vocab = {name: idx + 1 for idx, name in enumerate(all_champions)}  # 0 = padding/unknown
     champion_vocab["<UNK>"] = 0
@@ -139,6 +139,8 @@ def build_drafts(participants: pd.DataFrame, matches: pd.DataFrame) -> tuple[pd.
         rows.append(row)
 
     drafts = pd.DataFrame(rows)
+    if "blue_win" in drafts.columns:
+        drafts = drafts[drafts["blue_win"].notna()].reset_index(drop=True)
     logger.info("  Valid drafts: %d matches", len(drafts))
 
     # Join patch from matches table
@@ -226,6 +228,19 @@ def build_objectives(snapshots: pd.DataFrame, valid_match_ids: set) -> pd.DataFr
 
     snaps = snapshots[snapshots["match_id"].isin(valid_match_ids)].copy()
 
+    def normalize_team(row: pd.Series) -> int:
+        team_id = int(row.get("team_id", 0) or 0)
+        if team_id in (100, 200):
+            return team_id
+        if team_id in (1, 2):
+            return 100 if team_id == 1 else 200
+        participant_id = int(row.get("participant_id", 0) or 0)
+        if 1 <= participant_id <= 5:
+            return 100
+        if 6 <= participant_id <= 10:
+            return 200
+        return 0
+
     # Need one row per (match_id, minute, team_id) with objective counts
     obj_cols = [c for c in snaps.columns if c.startswith("team_") and c not in
                 ("team_id", "team_kills", "team_gold_diff")]
@@ -236,12 +251,8 @@ def build_objectives(snapshots: pd.DataFrame, valid_match_ids: set) -> pd.DataFr
 
     # Get per-team objective counts at each minute
     # Use first player per team per minute as representative
-    if "team_id" in snaps.columns:
-        team_col = "team_id"
-    else:
-        # Derive team from participant_id
-        snaps["team_id"] = snaps["participant_id"].apply(lambda x: TEAM_BLUE if x <= 5 else TEAM_RED)
-        team_col = "team_id"
+    snaps["canonical_team_id"] = snaps.apply(normalize_team, axis=1)
+    team_col = "canonical_team_id"
 
     team_snaps = (
         snaps.groupby(["match_id", "minute", team_col])[obj_cols]
@@ -361,6 +372,11 @@ def main():
     parser.add_argument("--queue-filter", type=int, default=420, help="Queue ID filter (420=ranked solo)")
     parser.add_argument("--no-augment", action="store_true", help="Skip side-swap augmentation")
     parser.add_argument("--min-games", type=int, default=100000, help="Minimum games required to proceed")
+    parser.add_argument(
+        "--allow-missing-objectives",
+        action="store_true",
+        help="Continue when objective labels are unavailable; those tasks will be masked",
+    )
     args = parser.parse_args()
 
     kaggle_dir = Path(args.kaggle_dir)
@@ -391,6 +407,25 @@ def main():
     # Build training targets
     gold_curves = build_gold_curves(snapshots, valid_match_ids)
     objectives = build_objectives(snapshots, valid_match_ids)
+    objective_columns = [
+        f"first_{name}_team" for name in ("dragon", "herald", "baron", "tower")
+    ]
+    missing_objectives = [
+        column
+        for column in objective_columns
+        if column not in objectives
+        or not objectives[column].isin([100, 200]).any()
+    ]
+    if missing_objectives:
+        message = (
+            "No resolvable team labels found for: "
+            + ", ".join(missing_objectives)
+            + ". Check source objective columns/team IDs."
+        )
+        if args.allow_missing_objectives:
+            logger.warning(message)
+        else:
+            raise ValueError(message + " Use --allow-missing-objectives to continue.")
 
     # Splits (before augmentation — augmented copies stay in same split as original)
     original_ids = list(drafts["match_id"])

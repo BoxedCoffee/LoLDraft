@@ -6,7 +6,7 @@ Extract draft embeddings from trained model for archetype clustering.
 import json
 import logging
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict
 
 import torch
 import numpy as np
@@ -19,32 +19,40 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("extract_embeddings")
 
 
-def load_model(checkpoint_path: str, device: str) -> DraftModel:
+def load_model(checkpoint_path: str, device: torch.device) -> tuple[DraftModel, dict]:
     """Load a trained model from checkpoint."""
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    champion_vocab = checkpoint["champion_vocab"]
+    patch_vocab = checkpoint.get("patch_vocab") or {}
+    model_cfg = checkpoint.get("config", {}).get("model", {})
 
     # Reconstruct model with same parameters
     model = DraftModel(
-        num_champions=checkpoint["champion_vocab"]["<PAD>"] + 1,
-        champion_dim=64,
-        draft_dim=256,
-        num_patches=len(checkpoint["patch_vocab"]) if checkpoint["patch_vocab"] else 0,
-        patch_dim=16,
-        team_hidden=512,
-        num_team_layers=3,
+        num_champions=len(champion_vocab),
+        champion_dim=model_cfg.get("champion_dim", 64),
+        draft_dim=model_cfg.get("draft_dim", 256),
+        num_patches=len(patch_vocab),
+        patch_dim=model_cfg.get("patch_dim", 16),
+        team_hidden=model_cfg.get("team_hidden", 512),
+        num_team_layers=model_cfg.get("num_team_layers", 3),
         num_gold_points=6,
         num_objectives=4,
-        dropout=0.1,
+        dropout=0.0,
     ).to(device)
 
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
-    return model
+    return model, patch_vocab
 
 
-def extract_embeddings(model: DraftModel, dataset: DraftDataset, device: str) -> Dict:
+def extract_embeddings(
+    model: DraftModel, dataset: DraftDataset, device: torch.device
+) -> Dict:
     """Extract all draft embeddings from dataset."""
     logger.info("Extracting embeddings...")
+
+    if len(dataset) == 0:
+        raise ValueError("The selected dataset split contains no drafts")
 
     dataloader = DataLoader(dataset, batch_size=512, shuffle=False, num_workers=4)
 
@@ -76,19 +84,18 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Using device: {device}")
 
-    # Load dataset (assuming it's already processed)
+    # Load the checkpoint before constructing the dataset so its patch
+    # vocabulary is reused exactly during inference.
     data_dir = Path("./data/processed")
-    test_ds = DraftDataset(data_dir, split="test")
-
-    # Load model
     checkpoint_path = "./checkpoints/best.pt"
     if not Path(checkpoint_path).exists():
         logger.error(f"Checkpoint not found at {checkpoint_path}")
         return
 
-    model = load_model(checkpoint_path, device)
+    model, patch_vocab = load_model(checkpoint_path, device)
 
     # Extract embeddings
+    test_ds = DraftDataset(data_dir, split="test", patch_vocab=patch_vocab)
     result = extract_embeddings(model, test_ds, device)
 
     # Save embeddings

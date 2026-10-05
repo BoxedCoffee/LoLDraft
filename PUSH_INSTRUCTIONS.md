@@ -1,43 +1,30 @@
-# How to Push Your Completed Draft Synergy Engine
+# Publishing checklist
 
-## Prerequisites
-Make sure you have committed all your changes before pushing:
+Run these checks from the repository root before publishing:
 
-## Step-by-Step Push Commands
-
-1. **Stage all your changes:**
-   ```bash
-   git add .
-   ```
-
-2. **Commit your changes with a descriptive message:**
-   ```bash
-   git commit -m "Complete implementation of Draft Synergy and Archetype Engine for League of Legends"
-   ```
-
-3. **Push to your remote repository (adjust origin if needed):**
-   ```bash
-   git push origin main
-   ```
-
-## Alternative Push Command (if you want to force push)
-If you need to overwrite history:
-```bash
-git push origin main --force-with-lease
+```powershell
+git lfs install
+git status
+git diff --cached --stat
+git diff --cached --check
+git ls-files | Select-String -Pattern '(^|/)(config.yaml|.*\.parquet|.*\.pt|.*\.db)$'
 ```
 
-## Verify Your Push
-After pushing, verify the contents are on GitHub:
-```bash
-git log --oneline -5
+The last command should not report local credentials or generated data. Use
+`config.example.yaml` as the shareable collector configuration template.
+
+Review the staged diff, then create a scoped commit:
+
+```powershell
+git add .
+git commit -m "Prepare draft analyzer for research release"
+git push origin main
 ```
 
-## Repository Structure After Push
-Your repository should contain:
-- `lol_collector/draft_encoder/` - Core model implementation
-- `clustering.py`, `extract_embeddings.py`, `recommendation_engine.py`, `dashboard.py` - System components  
-- `config/default.yaml` - Configuration files
-- `demo.py` - Demonstration script
-- `README.md` - Project documentation
+The first push includes Git LFS objects for `5mLoLGames/` and the canonical
+processed Riot Parquet files. Confirm the repository's GitHub LFS quota is
+available before pushing the large dataset objects.
 
-The implementation is complete and ready for use with the Kaggle League of Legends dataset.
+Do not force-push unless the repository owner explicitly decides to rewrite
+history. If a credential was ever committed, rotate it with Riot immediately;
+removing it from the current tree does not remove it from existing Git history.

@@ -236,10 +236,30 @@ def build_objectives(events_dir: Path, match_ids: set[str]) -> pd.DataFrame:
     match_id_list = list(match_ids)
     expr = ds.field("match_id").isin(match_id_list)
     scanner = dataset.scanner(
-        columns=["match_id", "timestamp_min", "event_type", "monster_type", "building_type", "team_id"],
+        columns=[
+            "match_id",
+            "timestamp_min",
+            "event_type",
+            "monster_type",
+            "building_type",
+            "team_id",
+            "killer_id",
+        ],
         filter=expr,
     )
     logger.info("Building objectives...")
+
+    def event_team(row: pd.Series) -> int:
+        """Resolve the team that secured an objective."""
+        killer_id = int(row.get("killer_id", 0) or 0)
+        if 1 <= killer_id <= 5:
+            return 100
+        if 6 <= killer_id <= 10:
+            return 200
+        team_id = int(row.get("team_id", 0) or 0)
+        if team_id in (100, 200):
+            return team_id
+        return 0
 
     first_team: dict[str, dict[str, int]] = {t: {} for t in ["dragon", "herald", "baron", "tower"]}
     first_min: dict[str, dict[str, float]] = {t: {} for t in ["dragon", "herald", "baron", "tower"]}
@@ -272,14 +292,18 @@ def build_objectives(events_dir: Path, match_ids: set[str]) -> pd.DataFrame:
                 sub = sub.sort_values(["match_id", "timestamp_min"])
                 first = sub.groupby("match_id").first().reset_index()
                 for _, r in first.iterrows():
-                    _update(obj_type, r["match_id"], float(r["timestamp_min"]), int(r["team_id"]))
+                    team = event_team(r)
+                    if team:
+                        _update(obj_type, r["match_id"], float(r["timestamp_min"]), team)
 
         towers = df[(df["event_type"] == "BUILDING_KILL") & (df["building_type"] == "TOWER_BUILDING")]
         if not towers.empty:
             towers = towers.sort_values(["match_id", "timestamp_min"])
             first = towers.groupby("match_id").first().reset_index()
             for _, r in first.iterrows():
-                _update("tower", r["match_id"], float(r["timestamp_min"]), int(r["team_id"]))
+                team = event_team(r)
+                if team:
+                    _update("tower", r["match_id"], float(r["timestamp_min"]), team)
 
     rows = []
     for mid in match_ids:
@@ -346,6 +370,20 @@ def main() -> None:
     valid_ids = set(base_ids)
     gold_curves = build_gold_curves(timelines_dir, valid_ids)
     objectives = build_objectives(events_dir, valid_ids)
+    objective_columns = [
+        f"first_{name}_team" for name in ("dragon", "herald", "baron", "tower")
+    ]
+    missing_objectives = [
+        column
+        for column in objective_columns
+        if column not in objectives
+        or not objectives[column].isin([100, 200]).any()
+    ]
+    if missing_objectives:
+        logger.warning(
+            "No resolvable team labels found for: %s",
+            ", ".join(missing_objectives),
+        )
 
     drafts.to_parquet(output_dir / "drafts.parquet", index=False)
     if len(gold_curves) > 0:

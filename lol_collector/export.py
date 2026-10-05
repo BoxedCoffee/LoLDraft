@@ -30,6 +30,17 @@ import pyarrow.parquet as pq
 logger = logging.getLogger("exporter")
 
 
+# Load champion data for name mapping
+def load_champion_data():
+    """Load champion data to map IDs to names."""
+    try:
+        with open('draft_encoder/data/champion_data.json', 'r') as f:
+            return json.load(f)
+    except FileNotFoundError:
+        # If the file doesn't exist, return empty dict
+        return {}
+
+
 def extract_patch(game_version: str) -> str:
     """Extract major.minor patch from game version string like '14.10.123.456'."""
     parts = game_version.split(".")
@@ -121,6 +132,9 @@ class ParquetExporter:
         self._event_buffer: list[dict] = []
         self._flush_count = 0
 
+        # Load champion data for name mapping
+        self.champion_data = load_champion_data()
+
         # Create directories
         for d in [self._matches_dir, self._timelines_dir, self._events_dir]:
             d.mkdir(parents=True, exist_ok=True)
@@ -148,6 +162,20 @@ class ParquetExporter:
             patch = extract_patch(game_version)
 
             for p_data in info.get("participants", []):
+                # Get champion ID and name
+                champion_id = p_data.get("championId", 0)
+
+                # Try to get champion name from champion_data mapping
+                champion_name = p_data.get("championName", "")
+                if champion_id and not champion_name:
+                    # If champion_name is empty but we have champion_id, try to map it
+                    champion_data_entry = self.champion_data.get(str(champion_id), {})
+                    champion_name = champion_data_entry.get("name", "")
+
+                # Ensure we have a fallback name if mapping fails
+                if not champion_name:
+                    champion_name = f"Champion_{champion_id}"
+
                 row = {
                     "match_id": match_id,
                     "platform": platform,
@@ -158,8 +186,8 @@ class ParquetExporter:
                     "queue_id": info.get("queueId", 0),
                     "participant_id": p_data.get("participantId", 0),
                     "team_id": p_data.get("teamId", 0),
-                    "champion_id": p_data.get("championId", 0),
-                    "champion_name": p_data.get("championName", ""),
+                    "champion_id": champion_id,
+                    "champion_name": champion_name,
                     "role": p_data.get("teamPosition", ""),
                     "individual_position": p_data.get("individualPosition", ""),
                     "puuid": p_data.get("puuid", ""),

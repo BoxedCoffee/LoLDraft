@@ -270,6 +270,7 @@ class DraftModel(nn.Module):
         obj_preds: list[torch.Tensor],
         obj_targets: list[torch.Tensor],
         gold_mask: torch.Tensor = None,
+        obj_mask: torch.Tensor = None,
     ) -> dict[str, torch.Tensor]:
         """
         Compute uncertainty-weighted multi-task loss.
@@ -282,16 +283,29 @@ class DraftModel(nn.Module):
         # Gold curve loss (MSE, optionally masked for missing timesteps)
         if gold_mask is not None:
             gold_diff = (gold_pred - gold_target) ** 2
-            loss_gold = (gold_diff * gold_mask).sum() / gold_mask.sum().clamp(min=1)
+            gold_count = gold_mask.sum()
+            loss_gold = (gold_diff * gold_mask).sum() / gold_count.clamp(min=1)
         else:
+            gold_count = gold_pred.new_tensor(gold_pred.numel())
             loss_gold = F.mse_loss(gold_pred, gold_target)
 
         # Objective loss (CE per objective type, averaged)
         obj_losses = []
-        for pred, target in zip(obj_preds, obj_targets):
-            if target.numel() > 0:
-                obj_losses.append(F.cross_entropy(pred, target))
-        loss_obj = torch.stack(obj_losses).mean() if obj_losses else torch.tensor(0.0, device=win_logit.device)
+        for index, (pred, target) in enumerate(zip(obj_preds, obj_targets)):
+            if obj_mask is None:
+                valid = torch.ones_like(target, dtype=torch.bool)
+            else:
+                valid = obj_mask[:, index] > 0
+            if valid.any():
+                obj_losses.append(F.cross_entropy(pred[valid], target[valid]))
+        loss_obj = (
+            torch.stack(obj_losses).mean()
+            if obj_losses
+            else win_logit.new_zeros(())
+        )
+        objective_count = (
+            obj_mask.sum() if obj_mask is not None else win_logit.new_tensor(1.0)
+        )
 
         # Uncertainty weighting: L_total = Σ (1/(2σ²)) * L_i + log(σ)
         # Using log_var = log(σ²), so 1/(2σ²) = 0.5 * exp(-log_var)
@@ -299,11 +313,11 @@ class DraftModel(nn.Module):
         w_gold = 0.5 * torch.exp(-self.log_var_gold)
         w_obj = 0.5 * torch.exp(-self.log_var_obj)
 
-        total = (
-            w_win * loss_win + 0.5 * self.log_var_win
-            + w_gold * loss_gold + 0.5 * self.log_var_gold
-            + w_obj * loss_obj + 0.5 * self.log_var_obj
-        )
+        total = w_win * loss_win + 0.5 * self.log_var_win
+        if gold_count > 0:
+            total = total + w_gold * loss_gold + 0.5 * self.log_var_gold
+        if objective_count > 0:
+            total = total + w_obj * loss_obj + 0.5 * self.log_var_obj
 
         return {
             "total": total,

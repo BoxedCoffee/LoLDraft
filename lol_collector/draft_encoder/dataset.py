@@ -92,7 +92,67 @@ class DraftDataset(Dataset):
         self._patches = np.array([
             self.patch_vocab.get(p, 0)
             for p in (drafts["patch"].values if "patch" in drafts.columns else ["unknown"] * len(drafts))
-        ])
+        ], dtype=np.int64)
+
+        self._gold_targets, self._gold_mask = self._build_gold_arrays(
+            self._match_ids, self._gold
+        )
+        self._obj_targets, self._obj_mask = self._build_objective_arrays(
+            self._match_ids, self._obj
+        )
+
+    @staticmethod
+    def _base_match_ids(match_ids: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        is_swapped = np.char.endswith(match_ids.astype(str), "_swap")
+        base_ids = np.char.replace(match_ids.astype(str), "_swap", "")
+        return base_ids, is_swapped
+
+    def _build_gold_arrays(self, match_ids, gold):
+        targets = np.zeros((len(match_ids), len(GOLD_COLUMNS)), dtype=np.float32)
+        mask = np.zeros_like(targets)
+        if gold is None:
+            return targets, mask
+
+        base_ids, is_swapped = self._base_match_ids(match_ids)
+        values = gold.reindex(base_ids)[GOLD_COLUMNS].to_numpy(dtype=np.float32)
+        valid = np.isfinite(values)
+        values = np.nan_to_num(values, nan=0.0)
+        values[is_swapped] *= -1
+        targets[:] = values
+        mask[:] = valid.astype(np.float32)
+        return targets, mask
+
+    def _build_objective_arrays(self, match_ids, objectives):
+        targets = np.zeros((len(match_ids), len(OBJ_TYPES)), dtype=np.int64)
+        mask = np.zeros((len(match_ids), len(OBJ_TYPES)), dtype=np.float32)
+        if objectives is None:
+            return targets, mask
+
+        base_ids, is_swapped = self._base_match_ids(match_ids)
+        rows = objectives.reindex(base_ids)
+        for index, obj_type in enumerate(OBJ_TYPES):
+            team_column = f"first_{obj_type}_team"
+            minute_column = f"first_{obj_type}_minute"
+            if team_column not in rows:
+                continue
+            team_ids = rows[team_column].fillna(0).to_numpy(dtype=np.int64)
+            minutes = (
+                rows[minute_column].fillna(0).to_numpy(dtype=np.float32)
+                if minute_column in rows
+                else np.zeros(len(rows), dtype=np.float32)
+            )
+            valid = np.isin(team_ids, [0, 100, 200]) & ~(
+                (team_ids == 0) & (minutes > 0)
+            )
+            classes = np.zeros(len(rows), dtype=np.int64)
+            classes[team_ids == 100] = 1
+            classes[team_ids == 200] = 2
+            classes[is_swapped & (classes > 0)] = 3 - classes[
+                is_swapped & (classes > 0)
+            ]
+            targets[:, index] = classes
+            mask[:, index] = valid.astype(np.float32)
+        return targets, mask
 
     def __len__(self) -> int:
         return len(self._match_ids)
@@ -103,42 +163,19 @@ class DraftDataset(Dataset):
 
     def __getitem__(self, idx: int) -> dict:
         match_id = self._match_ids[idx]
-        # For swapped matches, gold/obj data uses the original match_id
-        base_match_id = match_id.replace("_swap", "")
-        is_swapped = match_id.endswith("_swap")
 
         blue_champs = torch.tensor(self._blue[idx], dtype=torch.long)
         red_champs = torch.tensor(self._red[idx], dtype=torch.long)
         patch_id = torch.tensor(self._patches[idx], dtype=torch.long)
         win_label = torch.tensor(self._win[idx], dtype=torch.float32)
 
-        # Gold curves
-        gold_targets = torch.zeros(6, dtype=torch.float32)
-        gold_mask = torch.zeros(6, dtype=torch.float32)
-        if self._gold is not None and base_match_id in self._gold.index:
-            row = self._gold.loc[base_match_id]
-            for i, col in enumerate(GOLD_COLUMNS):
-                if col in row.index and pd.notna(row[col]):
-                    val = float(row[col])
-                    # If swapped, negate gold diff (blue perspective → red perspective)
-                    gold_targets[i] = -val if is_swapped else val
-                    gold_mask[i] = 1.0
-
-        # Objectives
-        obj_targets = torch.zeros(4, dtype=torch.long)  # default: 0 = none
-        if self._obj is not None and base_match_id in self._obj.index:
-            row = self._obj.loc[base_match_id]
-            for i, obj_type in enumerate(OBJ_TYPES):
-                col = f"first_{obj_type}_team"
-                if col in row.index and pd.notna(row[col]):
-                    team_id = int(row[col])
-                    cls = TEAM_TO_CLASS.get(team_id, 0)
-                    # If swapped, flip blue↔red
-                    if is_swapped and cls > 0:
-                        cls = 3 - cls  # 1→2, 2→1
-                    obj_targets[i] = cls
+        gold_targets = torch.from_numpy(self._gold_targets[idx])
+        gold_mask = torch.from_numpy(self._gold_mask[idx])
+        obj_targets = torch.from_numpy(self._obj_targets[idx])
+        obj_mask = torch.from_numpy(self._obj_mask[idx])
 
         return {
+            "match_id": match_id,
             "blue_champs": blue_champs,
             "red_champs": red_champs,
             "patch_id": patch_id,
@@ -146,4 +183,5 @@ class DraftDataset(Dataset):
             "gold_targets": gold_targets,
             "gold_mask": gold_mask,
             "obj_targets": obj_targets,
+            "obj_mask": obj_mask,
         }

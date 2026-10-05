@@ -3,6 +3,8 @@
 data_dir: "./data/processed"
 device: "cuda"  # "cuda" or "cpu"
 checkpoint_dir: "./checkpoints"
+seed: 42
+deterministic: false
 
 model:
   champion_dim: 64
@@ -19,3 +21,7 @@ training:
   max_epochs: 100
   patience: 10
   warmup_steps: 1000
+  num_workers: 0
+  checkpoint_metric: "win_logloss"
+  checkpoint_interval: 1
+  checkpoint_backup_keep: 5

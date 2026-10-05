@@ -1,12 +1,52 @@
 __pycache__/
 *.pyc
 
+# Local credentials and runtime configuration
 lol_collector/config.yaml
+config.local.yaml
+*.env
+*.env.*
+!.env.example
 
-
+# Collector state, logs, and downloaded Riot data
+data/
+lol_collector/data/
+lol_collector/temp_download/
+lol_collector/**/collection_state.db
+lol_collector/**/*.log
 5mLoLGames/
-backups/
+
+# Model and analysis artifacts
+**/checkpoints/
+**/eval_output*/
+**/analysis_output/
+**/kaggle_data/
+**/data/_tmp*/
+**/data/processed*/
+**/data/*_50k/
+**/*.pt
+**/*.pth
+**/*.parquet
+**/*.db
+**/*.sqlite
+**/*.sqlite3
 
 _incoming/
 
 *.zip
+
+# Local/editor/runtime files
+.streamlit/
+.vscode/
+.pytest_cache/
+*.tmp
+*.bak
+
+# Shared release datasets are intentionally tracked with Git LFS.
+!5mLoLGames/
+!5mLoLGames/**
+!lol_collector/draft_encoder/data/
+!lol_collector/draft_encoder/data/champion_data.json
+!lol_collector/draft_encoder/data/full_champion_mapping.json
+!lol_collector/draft_encoder/data/processed_riot/
+!lol_collector/draft_encoder/data/processed_riot/**
