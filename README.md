@@ -10,8 +10,8 @@ relate to early gold, objective control, comebacks, and victory.
   objectives, gold trajectories, comebacks, lane matchups, and composition
   indicators.
 - **Draft Encoder** (`lol_collector/draft_encoder/`): the original neural draft
-  predictor and training/evaluation workflow. It remains available as a safe
-  baseline and fallback.
+  encoder and training/evaluation workflow. It remains available as a safe
+  baseline and ablation model, not the primary predictor.
 - **Collector** (`lol_collector/`): an asynchronous, resumable Riot API pipeline
   for match metadata and timeline/event Parquet exports.
 
@@ -88,6 +88,24 @@ streamlit run app.py
 Training supports atomic recovery checkpoints, compatibility validation,
 timestamped backups, and explicit resume. Checkpoints and evaluation outputs
 are local artifacts and are excluded from Git.
+
+Before changing the neural architecture, benchmark simple held-out baselines:
+
+```powershell
+python benchmark_baselines.py `
+  --data-dir .\data\processed_riot `
+  --output .\eval_output_riot\baselines.json
+```
+
+The current shared-data benchmark shows that a champion-role logistic model
+provides a stronger draft-only reference than the original neural result. This
+project therefore treats the encoder as an ablation baseline and prioritizes
+evidence-aware analysis over unsupported win-prediction claims.
+
+Synthetic extrapolation is not used for final performance claims. Any future
+structured predictive model must be regularized and evaluated against the
+champion-role logistic reference before it can be considered for the
+application.
 
 ## Original offline pipeline
 

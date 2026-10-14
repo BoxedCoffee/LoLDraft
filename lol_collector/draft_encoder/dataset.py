@@ -42,8 +42,12 @@ class DraftDataset(Dataset):
         data_dir: str,
         split: str = "train",
         patch_vocab: Optional[dict] = None,
+        gold_scale: float = 1.0,
     ):
         data_dir = Path(data_dir)
+        if gold_scale <= 0:
+            raise ValueError("gold_scale must be greater than zero")
+        self.gold_scale = float(gold_scale)
 
         # Load splits
         with open(data_dir / "splits.json") as f:
@@ -118,6 +122,7 @@ class DraftDataset(Dataset):
         valid = np.isfinite(values)
         values = np.nan_to_num(values, nan=0.0)
         values[is_swapped] *= -1
+        values /= self.gold_scale
         targets[:] = values
         mask[:] = valid.astype(np.float32)
         return targets, mask

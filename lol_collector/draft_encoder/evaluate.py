@@ -89,7 +89,7 @@ def load_model(checkpoint_path: str, device: torch.device) -> tuple:
 
 
 @torch.no_grad()
-def compute_metrics(model, loader, device) -> dict:
+def compute_metrics(model, loader, device, gold_scale: float = 1.0) -> dict:
     """Compute all evaluation metrics."""
     all_win_preds = []
     all_win_labels = []
@@ -99,6 +99,7 @@ def compute_metrics(model, loader, device) -> dict:
     all_obj_preds = [[] for _ in range(4)]
     all_obj_labels = [[] for _ in range(4)]
     all_obj_masks = [[] for _ in range(4)]
+    all_patch_ids = []
     all_embeddings = []
 
     for batch in loader:
@@ -111,6 +112,7 @@ def compute_metrics(model, loader, device) -> dict:
         all_embeddings.append(embed.cpu().numpy())
         all_win_preds.append(torch.sigmoid(win_logit).cpu().numpy())
         all_win_labels.append(batch["win_label"].numpy())
+        all_patch_ids.append(batch["patch_id"].numpy())
         all_gold_preds.append(gold_pred.cpu().numpy())
         all_gold_targets.append(batch["gold_targets"].numpy())
         all_gold_masks.append(batch["gold_mask"].numpy())
@@ -125,10 +127,11 @@ def compute_metrics(model, loader, device) -> dict:
     # Concatenate
     win_preds = np.concatenate(all_win_preds)
     win_labels = np.concatenate(all_win_labels)
-    gold_preds = np.concatenate(all_gold_preds)
-    gold_targets = np.concatenate(all_gold_targets)
+    gold_preds = np.concatenate(all_gold_preds) * gold_scale
+    gold_targets = np.concatenate(all_gold_targets) * gold_scale
     gold_masks = np.concatenate(all_gold_masks)
     embeddings = np.concatenate(all_embeddings)
+    patch_ids = np.concatenate(all_patch_ids)
 
     # Win accuracy
     win_acc = ((win_preds > 0.5) == win_labels).mean()
@@ -148,14 +151,34 @@ def compute_metrics(model, loader, device) -> dict:
     baseline_brier = float(np.mean((baseline_probability - win_labels) ** 2))
     win_accuracy_ci = bootstrap_accuracy_interval(win_preds, win_labels)
     try:
-        from sklearn.metrics import balanced_accuracy_score, roc_auc_score
+        from sklearn.metrics import (
+            balanced_accuracy_score,
+            f1_score,
+            roc_auc_score,
+        )
         win_balanced_accuracy = float(
             balanced_accuracy_score(win_labels, win_preds > 0.5)
         )
         win_auc = float(roc_auc_score(win_labels, win_preds))
+        win_macro_f1 = float(f1_score(win_labels, win_preds > 0.5, average="macro"))
     except (ImportError, ValueError):
         win_balanced_accuracy = None
         win_auc = None
+        win_macro_f1 = None
+
+    patch_baseline_logloss = None
+    patch_baseline_brier = None
+    try:
+        from sklearn.metrics import log_loss
+
+        patch_probabilities = np.full_like(win_preds, win_labels.mean(), dtype=float)
+        for patch_id in np.unique(patch_ids):
+            mask = patch_ids == patch_id
+            patch_probabilities[mask] = win_labels[mask].mean()
+        patch_baseline_logloss = float(log_loss(win_labels, patch_probabilities, labels=[0, 1]))
+        patch_baseline_brier = float(np.mean((patch_probabilities - win_labels) ** 2))
+    except (ImportError, ValueError):
+        pass
 
     # Gold MAE per timestep
     gold_mae = {}
@@ -163,7 +186,9 @@ def compute_metrics(model, loader, device) -> dict:
         mask = gold_masks[:, i] > 0
         if mask.sum() > 0:
             mae = np.abs(gold_preds[mask, i] - gold_targets[mask, i]).mean()
-            mean_baseline = np.abs(gold_targets[mask, i] - gold_targets[mask, i].mean()).mean()
+            mean_baseline = np.abs(
+                gold_targets[mask, i] - gold_targets[mask, i].mean()
+            ).mean()
             gold_mae[f"min_{minute}"] = {"mae": float(mae), "mean_baseline": float(mean_baseline)}
 
     # Objective accuracy
@@ -177,8 +202,14 @@ def compute_metrics(model, loader, device) -> dict:
             continue
         acc = (preds == labels).mean()
         majority = max(np.bincount(labels, minlength=3) / len(labels))
+        try:
+            from sklearn.metrics import f1_score
+            macro_f1 = float(f1_score(labels, preds, average="macro", zero_division=0))
+        except ImportError:
+            macro_f1 = None
         obj_acc[name] = {
             "accuracy": float(acc),
+            "macro_f1": macro_f1,
             "majority_baseline": float(majority),
             "samples": int(len(labels)),
             "class_counts": {
@@ -194,7 +225,10 @@ def compute_metrics(model, loader, device) -> dict:
         "win_baseline_logloss": baseline_logloss,
         "win_brier": win_brier,
         "win_baseline_brier": baseline_brier,
+        "win_patch_baseline_logloss": patch_baseline_logloss,
+        "win_patch_baseline_brier": patch_baseline_brier,
         "win_balanced_accuracy": win_balanced_accuracy,
+        "win_macro_f1": win_macro_f1,
         "win_auc": win_auc,
         "win_accuracy_ci_95": win_accuracy_ci,
         "gold_mae": gold_mae,
@@ -307,14 +341,20 @@ def main():
     model, champion_vocab, patch_vocab, cfg = load_model(args.checkpoint, device)
 
     # Test set
-    test_ds = DraftDataset(args.data_dir, split="test", patch_vocab=patch_vocab)
+    gold_scale = float(cfg.get("training", {}).get("gold_scale", 1.0))
+    test_ds = DraftDataset(
+        args.data_dir,
+        split="test",
+        patch_vocab=patch_vocab,
+        gold_scale=gold_scale,
+    )
     test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False,
                              num_workers=4, pin_memory=True)
 
     logger.info("Test set: %d samples", len(test_ds))
 
     # Compute metrics
-    metrics = compute_metrics(model, test_loader, device)
+    metrics = compute_metrics(model, test_loader, device, gold_scale=gold_scale)
 
     # Print results
     logger.info("=" * 50)

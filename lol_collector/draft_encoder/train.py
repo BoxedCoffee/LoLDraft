@@ -124,7 +124,7 @@ def set_seed(seed: int, deterministic: bool = False) -> None:
         torch.backends.cudnn.benchmark = True
 
 
-def train_one_epoch(model, loader, optimizer, device, epoch):
+def train_one_epoch(model, loader, optimizer, device, epoch, task_weights=None):
     model.train()
     totals = {"total": 0, "win": 0, "gold": 0, "obj": 0, "n": 0}
 
@@ -142,7 +142,8 @@ def train_one_epoch(model, loader, optimizer, device, epoch):
 
         obj_targets = [obj_t[:, i] for i in range(obj_t.shape[1])]
         losses = model.compute_loss(
-            win_logit, win, gold_pred, gold_t, obj_preds, obj_targets, gold_m, obj_m
+            win_logit, win, gold_pred, gold_t, obj_preds, obj_targets,
+            gold_m, obj_m, task_weights=task_weights
         )
 
         optimizer.zero_grad()
@@ -162,7 +163,7 @@ def train_one_epoch(model, loader, optimizer, device, epoch):
 
 
 @torch.no_grad()
-def evaluate(model, loader, device):
+def evaluate(model, loader, device, task_weights=None):
     model.eval()
     totals = {"total": 0, "win": 0, "gold": 0, "obj": 0, "n": 0}
     correct = 0
@@ -182,7 +183,8 @@ def evaluate(model, loader, device):
 
         obj_targets = [obj_t[:, i] for i in range(obj_t.shape[1])]
         losses = model.compute_loss(
-            win_logit, win, gold_pred, gold_t, obj_preds, obj_targets, gold_m, obj_m
+            win_logit, win, gold_pred, gold_t, obj_preds, obj_targets,
+            gold_m, obj_m, task_weights=task_weights
         )
 
         bs = blue.shape[0]
@@ -243,8 +245,11 @@ def main():
             logger.warning("wandb not installed — skipping")
 
     # Datasets
-    train_ds = DraftDataset(data_dir, split="train")
-    val_ds = DraftDataset(data_dir, split="val", patch_vocab=train_ds.patch_vocab)
+    gold_scale = float(cfg.get("training", {}).get("gold_scale", 1.0))
+    train_ds = DraftDataset(data_dir, split="train", gold_scale=gold_scale)
+    val_ds = DraftDataset(
+        data_dir, split="val", patch_vocab=train_ds.patch_vocab, gold_scale=gold_scale
+    )
 
     logger.info("Train: %d samples | Val: %d samples", len(train_ds), len(val_ds))
     if not len(train_ds) or not len(val_ds):
@@ -286,6 +291,14 @@ def main():
             raise ValueError("Resume checkpoint training split size does not match the dataset")
         if resume_checkpoint.get("val_size") not in (None, len(val_ds)):
             raise ValueError("Resume checkpoint validation split size does not match the dataset")
+        saved_gold_scale = float(
+            resume_checkpoint.get("config", {}).get("training", {}).get("gold_scale", 1.0)
+        )
+        if saved_gold_scale != gold_scale:
+            raise ValueError(
+                "Resume checkpoint gold scaling does not match the current config: "
+                f"saved={saved_gold_scale}, current={gold_scale}"
+            )
         saved_signature = resume_checkpoint.get("model_signature")
         if saved_signature is not None and saved_signature != model_config_signature(cfg):
             raise ValueError(
@@ -313,6 +326,26 @@ def main():
 
     # Training setup
     train_cfg = cfg.get("training", {})
+    loss_mode = str(train_cfg.get("loss_mode", "uncertainty"))
+    if loss_mode == "win_only":
+        task_weights = {"win": 1.0, "gold": 0.0, "obj": 0.0}
+    elif loss_mode == "fixed":
+        task_weights = {
+            "win": float(train_cfg.get("win_loss_weight", 1.0)),
+            "gold": float(train_cfg.get("gold_loss_weight", 0.25)),
+            "obj": float(train_cfg.get("objective_loss_weight", 0.25)),
+        }
+    elif loss_mode == "uncertainty":
+        task_weights = None
+    else:
+        raise ValueError(
+            "training.loss_mode must be one of: uncertainty, fixed, win_only"
+        )
+    logger.info(
+        "Loss mode: %s%s",
+        loss_mode,
+        f" weights={task_weights}" if task_weights else "",
+    )
     batch_size = train_cfg.get("batch_size", 512)
     lr = train_cfg.get("learning_rate", 3e-4)
     weight_decay = train_cfg.get("weight_decay", 0.01)
@@ -394,6 +427,14 @@ def main():
             raise ValueError("Resume checkpoint training split size does not match the dataset")
         if checkpoint.get("val_size") not in (None, len(val_ds)):
             raise ValueError("Resume checkpoint validation split size does not match the dataset")
+        saved_gold_scale = float(
+            checkpoint.get("config", {}).get("training", {}).get("gold_scale", 1.0)
+        )
+        if saved_gold_scale != gold_scale:
+            raise ValueError(
+                "Resume checkpoint gold scaling does not match the current config: "
+                f"saved={saved_gold_scale}, current={gold_scale}"
+            )
         saved_metric = checkpoint.get("checkpoint_metric", checkpoint_metric)
         if saved_metric != checkpoint_metric:
             raise ValueError(
@@ -424,12 +465,14 @@ def main():
         t0 = time.time()
 
         # Train
-        train_metrics = train_one_epoch(model, train_loader, optimizer, device, epoch)
+        train_metrics = train_one_epoch(
+            model, train_loader, optimizer, device, epoch, task_weights
+        )
         global_step += len(train_loader)
         scheduler.step()
 
         # Validate
-        val_metrics = evaluate(model, val_loader, device)
+        val_metrics = evaluate(model, val_loader, device, task_weights)
 
         elapsed = time.time() - t0
 
@@ -443,9 +486,14 @@ def main():
 
         # Log task weights
         with torch.no_grad():
-            w_win = (0.5 * torch.exp(-model.log_var_win)).item()
-            w_gold = (0.5 * torch.exp(-model.log_var_gold)).item()
-            w_obj = (0.5 * torch.exp(-model.log_var_obj)).item()
+            if task_weights is None:
+                w_win = (0.5 * torch.exp(-model.log_var_win)).item()
+                w_gold = (0.5 * torch.exp(-model.log_var_gold)).item()
+                w_obj = (0.5 * torch.exp(-model.log_var_obj)).item()
+            else:
+                w_win = task_weights["win"]
+                w_gold = task_weights["gold"]
+                w_obj = task_weights["obj"]
         logger.info("  Task weights: win=%.3f gold=%.3f obj=%.3f", w_win, w_gold, w_obj)
 
         if wandb_run:

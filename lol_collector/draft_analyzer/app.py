@@ -243,14 +243,17 @@ all_champions = sorted(
 
 st.markdown(
     '<div class="hero"><div class="kicker">League of Legends · historical draft research</div>'
-    '<h1>Draft to Victory</h1>'
-    '<p>Explore how compositions relate to early gold, objective control, comebacks, and lead conversion.</p></div>',
+    '<h1>Draft Pathways</h1>'
+    '<p>Explore historical associations between compositions, early gold, objectives, comebacks, and lead conversion.</p></div>',
     unsafe_allow_html=True,
 )
 
 with st.sidebar:
     st.header("Build a draft")
-    st.caption("Pick as many roles as you know. More selections make the historical comparison narrower.")
+    st.caption(
+        "Pick as many roles as you know. More selections narrow the historical "
+        "comparison; this tool reports associations, not guaranteed outcomes."
+    )
     comparison_mode = st.selectbox(
         "Comparison breadth",
         ["Auto (recommended)", "Role-aware (either side)", "Exact roles & sides", "Champion presence"],
@@ -337,7 +340,11 @@ with tabs[0]:
     win_rate = similar.blue_win.mean()
     win_low, win_high = wilson_interval(similar.blue_win)
     baseline = scoped_table.blue_win.mean()
-    cards[0].metric("Blue win rate", pct(win_rate), f"{(win_rate - baseline) * 100:+.1f} pts vs dataset")
+    cards[0].metric(
+        "Observed Blue win rate",
+        pct(win_rate),
+        f"{(win_rate - baseline) * 100:+.1f} pts vs dataset",
+    )
     cards[1].metric("First Dragon", pct(similar.blue_first_dragon.mean()))
     cards[2].metric("First Tower", pct(similar.blue_first_tower.mean()))
     cards[3].metric(

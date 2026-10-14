@@ -1,9 +1,11 @@
-# League of Legends Draft Predictor
+# League of Legends Draft Encoder Baseline
 
-This is a Streamlit application that predicts outcomes of League of Legends drafts using a neural network model trained on professional match data.
+This is the original neural draft encoder and Streamlit demonstration. It is
+retained as a baseline and ablation model for the senior project, not as the
+primary research application or a guaranteed outcome predictor.
 
 ## Features
-- Predict win probability for a given draft composition
+- Compare draft-only win estimates against held-out baselines
 - Show predicted gold curve at 5-minute intervals
 - Predict first objectives (baron, dragon, tower, inhibitors)
 
@@ -67,7 +69,31 @@ creates backups of existing checkpoints instead of silently discarding them.
 
 The model is a draft-only estimate. It does not include player skill,
 champion mastery, lane matchup execution, or in-game decisions; close
-probabilities should be treated as low-confidence results.
+probabilities should be treated as low-confidence results. The Draft Analyzer
+is the primary application because it presents historical evidence and its
+limitations directly.
+
+Gold targets are normalized by `training.gold_scale` (1000 raw gold by
+default) during multitask training. Evaluation converts predictions back to
+raw gold units, so reported MAE remains interpretable.
+
+Use `training.loss_mode: fixed` for an explicit `1.0 / 0.25 / 0.25` win,
+gold, and objective ablation, or `training.loss_mode: win_only` to test
+whether auxiliary targets help the win task. The default `uncertainty` mode
+learns task scaling and should be compared against both fixed alternatives.
+
+Benchmark simple baselines before changing the neural architecture:
+
+```powershell
+python benchmark_baselines.py `
+  --data-dir .\data\processed_riot `
+  --output .\eval_output_riot\baselines.json
+```
+
+The benchmark includes an overall Blue-side rate, a patch-specific rate, and a
+regularized champion-role logistic model. A neural change is only useful if it
+beats these baselines on held-out patches or matches, not merely training
+loss.
 2. Run the Streamlit app:
 ```bash
 streamlit run app.py

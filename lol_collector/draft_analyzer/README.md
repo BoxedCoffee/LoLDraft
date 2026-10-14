@@ -26,7 +26,9 @@ streamlit run app.py
 
 The UI is intentionally descriptive: it reports historical associations for
 similar drafts and labels the result as low-confidence analysis rather than
-claiming causal or guaranteed predictions.
+claiming causal or guaranteed predictions. It is the primary project
+application; the neural Draft Encoder is retained as a baseline and ablation
+model.
 
 The interface is organized into four views:
 
@@ -50,6 +52,16 @@ The sidebar provides three comparison breadths:
 
 Broader modes are intentional: they provide enough observations for descriptive
 analysis while the UI clearly labels that they are not exact-draft predictions.
+
+## Modeling policy
+
+The project does not use synthetic extrapolation for final performance claims.
+Synthetic examples may be used for software tests, but all reported research
+results come from held-out real matches. The champion-role logistic model is
+the current draft-only predictive reference because it outperforms the neural
+baseline on the shared held-out data. Any future predictive model must be
+regularized, evaluated against that reference, and kept separate from the
+historical evidence interface unless it demonstrates reliable improvement.
 
 The UI also includes an evidence ladder showing the available sample size under
 each comparison mode, Wilson 95% intervals for win and conversion rates, deltas
