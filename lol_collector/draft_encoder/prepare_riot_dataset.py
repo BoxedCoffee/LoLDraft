@@ -257,6 +257,8 @@ def build_objectives(events_dir: Path, match_ids: set[str]) -> pd.DataFrame:
         if 6 <= killer_id <= 10:
             return 200
         team_id = int(row.get("team_id", 0) or 0)
+        if row.get("event_type") == "BUILDING_KILL" and killer_id == 0:
+            return 300 - team_id if team_id in (100, 200) else 0
         if team_id in (100, 200):
             return team_id
         return 0

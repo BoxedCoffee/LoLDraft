@@ -4,11 +4,31 @@ Simple inference script for the draft encoder model.
 This demonstrates how to use the trained model for making predictions on new draft compositions.
 """
 
-import torch
-import numpy as np
-from model import DraftModel
 import argparse
+import json
 from pathlib import Path
+
+import numpy as np
+import torch
+from model import DraftModel
+OBJECTIVE_CLASSES = {0: "None", 1: "Blue Team", 2: "Red Team"}
+
+
+def normalize_champion_name(name: str) -> str:
+    return "".join(character.casefold() for character in name if character.isalnum())
+
+
+def build_normalized_vocab(champion_vocab: dict, champion_mapping: dict | None = None) -> dict[str, int]:
+    resolved = {
+        normalize_champion_name(name): int(champion_id)
+        for name, champion_id in champion_vocab.items()
+        if name != "<UNK>" and int(champion_id) > 0
+    }
+    if champion_mapping:
+        for name, riot_id in champion_mapping.items():
+            if str(riot_id) in champion_vocab and int(champion_vocab[str(riot_id)]) > 0:
+                resolved[normalize_champion_name(name)] = int(champion_vocab[str(riot_id)])
+    return resolved
 
 def load_model(checkpoint_path: str, device: torch.device):
     """Load a trained model from checkpoint."""
@@ -34,7 +54,7 @@ def load_model(checkpoint_path: str, device: torch.device):
     model.eval()
     return model, champion_vocab, patch_vocab
 
-def predict_draft(model, champion_vocab, patch_vocab, blue_team, red_team, device):
+def predict_draft(model, champion_vocab, patch_vocab, blue_team, red_team, device, champion_mapping=None):
     """
     Make a prediction for a draft composition.
 
@@ -51,8 +71,9 @@ def predict_draft(model, champion_vocab, patch_vocab, blue_team, red_team, devic
     """
 
     # Convert champion names to IDs
-    blue_ids = [champion_vocab.get(c, 0) for c in blue_team]
-    red_ids = [champion_vocab.get(c, 0) for c in red_team]
+    normalized_vocab = build_normalized_vocab(champion_vocab, champion_mapping)
+    blue_ids = [normalized_vocab.get(normalize_champion_name(c), 0) for c in blue_team]
+    red_ids = [normalized_vocab.get(normalize_champion_name(c), 0) for c in red_team]
 
     # Create tensors
     blue_tensor = torch.tensor([blue_ids], dtype=torch.long, device=device)
@@ -70,13 +91,16 @@ def predict_draft(model, champion_vocab, patch_vocab, blue_team, red_team, devic
         obj_predictions = []
         for pred in obj_preds:
             obj_pred = torch.argmax(pred, dim=-1).item()
-            obj_predictions.append(obj_pred)  # 0=blue, 1=red, 2=none
+            obj_predictions.append(obj_pred)  # 0=none, 1=blue, 2=red
 
         return {
             'draft_embedding': draft_embed.cpu().numpy()[0],
             'win_probability': win_prob,
             'gold_curve_prediction': gold_pred.cpu().numpy()[0],
             'objective_predictions': obj_predictions,
+            'objective_labels': [OBJECTIVE_CLASSES.get(c, "Unknown") for c in obj_predictions],
+            'blue_ids': blue_ids,
+            'red_ids': red_ids,
             'blue_team': blue_team,
             'red_team': red_team
         }
@@ -94,6 +118,8 @@ def main():
 
     # Load model
     model, champion_vocab, patch_vocab = load_model(args.checkpoint, device)
+    mapping_path = Path(__file__).resolve().parent / "data" / "full_champion_mapping.json"
+    champion_mapping = json.loads(mapping_path.read_text(encoding="utf-8")) if mapping_path.exists() else None
 
     # Example prediction - you can modify this with your own teams
     print("\nMaking example predictions...")
@@ -102,7 +128,7 @@ def main():
     blue_team_1 = ["Malphite", "Amumu", "Orianna", "MissFortune", "Leona"]
     red_team_1 = ["Gnar", "LeeSin", "Ahri", "Jinx", "Thresh"]
 
-    result_1 = predict_draft(model, champion_vocab, patch_vocab, blue_team_1, red_team_1, device)
+    result_1 = predict_draft(model, champion_vocab, patch_vocab, blue_team_1, red_team_1, device, champion_mapping)
 
     print(f"\nExample 1:")
     print(f"Blue Team: {blue_team_1}")
@@ -115,7 +141,7 @@ def main():
     blue_team_2 = ["Jayce", "Nidalee", "Xerath", "Ezreal", "Karma"]
     red_team_2 = ["Gnar", "LeeSin", "Ahri", "Jinx", "Thresh"]
 
-    result_2 = predict_draft(model, champion_vocab, patch_vocab, blue_team_2, red_team_2, device)
+    result_2 = predict_draft(model, champion_vocab, patch_vocab, blue_team_2, red_team_2, device, champion_mapping)
 
     print(f"\nExample 2:")
     print(f"Blue Team: {blue_team_2}")

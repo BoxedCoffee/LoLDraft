@@ -259,7 +259,16 @@ def visualize_embeddings(embeddings: np.ndarray, labels: np.ndarray, output_path
 
     try:
         from sklearn.manifold import TSNE
-        tsne = TSNE(n_components=2, perplexity=30, n_iter=1000, random_state=42)
+        perplexity = min(30, max(5, (len(embeddings) - 1) // 3))
+        kwargs = {"n_components": 2, "perplexity": perplexity, "random_state": 42}
+        try:
+            TSNE.__init__
+            kwargs["max_iter"] = 1000
+            tsne = TSNE(**kwargs)
+        except TypeError:
+            kwargs.pop("max_iter", None)
+            kwargs["n_iter"] = 1000
+            tsne = TSNE(**kwargs)
         coords = tsne.fit_transform(embeddings)
     except ImportError:
         logger.warning("sklearn not available — skipping t-SNE")

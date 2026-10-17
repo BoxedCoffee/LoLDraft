@@ -31,14 +31,26 @@ logger = logging.getLogger("exporter")
 
 
 # Load champion data for name mapping
-def load_champion_data():
-    """Load champion data to map IDs to names."""
+def load_champion_data() -> dict[str, dict]:
+    """Load champion data using paths relative to this module."""
+    data_dir = Path(__file__).resolve().parent / "draft_encoder" / "data"
+    mapping: dict[str, dict] = {}
     try:
-        with open('draft_encoder/data/champion_data.json', 'r') as f:
-            return json.load(f)
-    except FileNotFoundError:
-        # If the file doesn't exist, return empty dict
-        return {}
+        champion_data_path = data_dir / "champion_data.json"
+        if champion_data_path.exists():
+            raw = json.loads(champion_data_path.read_text(encoding="utf-8"))
+            for key, entry in raw.items():
+                mapping[str(key)] = entry
+                if entry.get("riot_id") is not None:
+                    mapping[str(entry["riot_id"])] = entry
+        name_map_path = data_dir / "champion_name_mapping.json"
+        if name_map_path.exists():
+            name_map = json.loads(name_map_path.read_text(encoding="utf-8"))
+            for riot_id, name in name_map.items():
+                mapping.setdefault(str(riot_id), {"name": name})
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        pass
+    return mapping
 
 
 def extract_patch(game_version: str) -> str:

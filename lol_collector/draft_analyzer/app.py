@@ -17,7 +17,7 @@ OBJECTIVES = ["dragon", "herald", "baron", "tower"]
 OBJECTIVE_LABELS = {"dragon": "Dragon", "herald": "Herald", "baron": "Baron", "tower": "Tower"}
 ARCHETYPE_RULES = {
     "Engage": {"malphite", "amumu", "leona", "nautilus", "rell", "sejuani", "ornn", "wukong", "jarvan iv", "zac"},
-    "Poke": {"xerath", "ezreal", "jayce", "nidalee", "varus", "karma", "lux", "vel'koz", "zoe", "jayce"},
+    "Poke": {"xerath", "ezreal", "jayce", "nidalee", "varus", "karma", "lux", "vel'koz", "zoe"},
     "Scaling": {"vayne", "nasus", "kayle", "kassadin", "senna", "jinx", "azir", "sivir", "twitch", "gangplank"},
     "Split push": {"fiora", "tryndamere", "camille", "yorick", "trundle", "jax", "shen"},
 }
@@ -50,19 +50,48 @@ st.markdown(
 )
 
 
+def build_champion_id_mapping(encoder_data_dir: Path) -> dict[str, str]:
+    """Resolve vocabulary IDs, Riot IDs, and display names consistently."""
+    mapping: dict[str, str] = {}
+    riot_id_to_name: dict[str, str] = {}
+
+    full_mapping_path = encoder_data_dir / "full_champion_mapping.json"
+    if full_mapping_path.exists():
+        full_mapping = json.loads(full_mapping_path.read_text(encoding="utf-8"))
+        riot_id_to_name.update(
+            {str(riot_id): name for name, riot_id in full_mapping.items()}
+        )
+
+    champion_data_path = encoder_data_dir / "champion_data.json"
+    if champion_data_path.exists():
+        champion_data = json.loads(champion_data_path.read_text(encoding="utf-8"))
+        for key, entry in champion_data.items():
+            name = entry.get("name")
+            if not name:
+                continue
+            mapping[str(key)] = name
+            if entry.get("riot_id") is not None:
+                riot_id_to_name[str(entry["riot_id"])] = name
+
+    vocab_path = encoder_data_dir / "processed_riot" / "champion_vocab.json"
+    if vocab_path.exists():
+        vocab = json.loads(vocab_path.read_text(encoding="utf-8"))
+        for riot_id, vocab_id in vocab.items():
+            if riot_id != "<UNK>" and str(riot_id) in riot_id_to_name:
+                mapping[str(vocab_id)] = riot_id_to_name[str(riot_id)]
+
+    for riot_id, name in riot_id_to_name.items():
+        mapping.setdefault(riot_id, name)
+    return mapping
+
+
 @st.cache_data
 def load_artifacts():
     table = pd.read_parquet(OUTPUT_DIR / "match_analysis.parquet")
     stats = pd.read_parquet(OUTPUT_DIR / "champion_role_stats.parquet")
-    champion_data_path = APP_DIR.parent / "draft_encoder" / "data" / "champion_data.json"
-    mapping = {}
-    if champion_data_path.exists():
-        champion_data = json.loads(champion_data_path.read_text(encoding="utf-8"))
-        mapping = {
-            str(champion_id): entry["name"]
-            for champion_id, entry in champion_data.items()
-            if entry.get("name")
-        }
+    encoder_data_dir = APP_DIR.parent / "draft_encoder" / "data"
+    mapping = build_champion_id_mapping(encoder_data_dir)
+    if mapping:
         for role in ROLES:
             for side in ("blue", "red"):
                 column = f"{side}_{role}"
