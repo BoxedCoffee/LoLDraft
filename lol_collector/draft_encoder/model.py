@@ -8,6 +8,9 @@ Architecture:
     - Explicit lane matchup diffs (blue_role - red_role) and Hadamard products (blue_role * red_role)
     - Intra-team pairwise role synergy interactions (10 pairs per side)
   Blue team vec + Red team vec (+ optional patch embed) → project + gated interaction residual → 256-dim draft embedding
+  Wide & Deep Win Head:
+    - Anti-symmetric additive role-champion base strength (subsumes role_champion_logistic)
+    - Deep non-linear draft embedding head for pairwise synergies & lane counters
 
 Output heads (multi-task):
   1. Win prediction: BCE
@@ -70,7 +73,6 @@ class MatchupSynergyBlock(nn.Module):
         super().__init__()
         self.champion_dim = champion_dim
         self.num_roles = num_roles
-        # Pair indices for C(num_roles, 2) = 10 intra-team pairs
         pairs = [(i, j) for i in range(num_roles) for j in range(i + 1, num_roles)]
         self.register_buffer(
             "pair_left", torch.tensor([p[0] for p in pairs], dtype=torch.long), persistent=False
@@ -79,11 +81,6 @@ class MatchupSynergyBlock(nn.Module):
             "pair_right", torch.tensor([p[1] for p in pairs], dtype=torch.long), persistent=False
         )
 
-        # Features:
-        #   1) 5 lane diffs (blue_r - red_r): num_roles * champion_dim
-        #   2) 5 lane Hadamard products (blue_r * red_r): num_roles * champion_dim
-        #   3) Mean intra-team pairwise Hadamard for Blue + Red: 2 * champion_dim
-        #   4) Pairwise scaled dot products (10 for Blue + 10 for Red + 5 lane dots): 2 * len(pairs) + num_roles
         num_pairs = len(pairs)
         in_features = (2 * num_roles * champion_dim) + (2 * champion_dim) + (2 * num_pairs + num_roles)
 
@@ -103,22 +100,20 @@ class MatchupSynergyBlock(nn.Module):
         batch_size = blue_roles.shape[0]
         scale = self.champion_dim ** -0.5
 
-        # 1. Role-aligned lane matchup interactions
         lane_diff = (blue_roles - red_roles).reshape(batch_size, -1)
         lane_prod = (blue_roles * red_roles).reshape(batch_size, -1)
         lane_dots = (blue_roles * red_roles).sum(dim=-1) * scale  # (batch, 5)
 
-        # 2. Intra-team pairwise synergies (10 role pairs per team)
         b_left = blue_roles[:, self.pair_left, :]
         b_right = blue_roles[:, self.pair_right, :]
         r_left = red_roles[:, self.pair_left, :]
         r_right = red_roles[:, self.pair_right, :]
 
-        blue_pair_prod = (b_left * b_right).mean(dim=1)  # (batch, champion_dim)
-        red_pair_prod = (r_left * r_right).mean(dim=1)   # (batch, champion_dim)
+        blue_pair_prod = (b_left * b_right).mean(dim=1)
+        red_pair_prod = (r_left * r_right).mean(dim=1)
 
-        blue_pair_dots = (b_left * b_right).sum(dim=-1) * scale  # (batch, 10)
-        red_pair_dots = (r_left * r_right).sum(dim=-1) * scale   # (batch, 10)
+        blue_pair_dots = (b_left * b_right).sum(dim=-1) * scale
+        red_pair_dots = (r_left * r_right).sum(dim=-1) * scale
 
         features = torch.cat(
             [
@@ -138,18 +133,6 @@ class MatchupSynergyBlock(nn.Module):
 class DraftEncoder(nn.Module):
     """
     Full draft encoder: 10 champion IDs → 256-dim draft embedding.
-
-    Args:
-        num_champions: size of champion vocabulary (including <UNK> at 0)
-        champion_dim: embedding dimension per champion (default 64)
-        num_roles: number of roles (5: top, jng, mid, bot, sup)
-        team_hidden: hidden dim in team MLP
-        draft_dim: output draft embedding dimension
-        num_patches: number of unique patches (0 to disable patch embedding)
-        patch_dim: patch embedding dimension
-        num_team_layers: depth of team MLP
-        dropout: dropout rate
-        use_matchup_interactions: whether to add explicit lane matchup & pairwise synergy block
     """
 
     def __init__(
@@ -170,14 +153,10 @@ class DraftEncoder(nn.Module):
         self.num_roles = num_roles
         self.use_matchup_interactions = use_matchup_interactions
 
-        # Champion embeddings (shared across both teams)
         self.champion_embed = nn.Embedding(num_champions, champion_dim, padding_idx=0)
-
-        # Role positional encoding (added to champion embedding)
         self.role_embed = nn.Embedding(num_roles, champion_dim)
 
-        # Team encoders (shared weights for blue and red)
-        team_input_dim = num_roles * champion_dim  # 5 * 64 = 320
+        team_input_dim = num_roles * champion_dim
         self.team_encoder = TeamEncoder(
             input_dim=team_input_dim,
             hidden_dim=team_hidden,
@@ -186,8 +165,7 @@ class DraftEncoder(nn.Module):
             dropout=dropout,
         )
 
-        # Draft projection: combine blue + red team vectors
-        combine_dim = draft_dim * 2  # 512
+        combine_dim = draft_dim * 2
         if num_patches > 0:
             self.patch_embed = nn.Embedding(num_patches, patch_dim)
             combine_dim += patch_dim
@@ -223,7 +201,6 @@ class DraftEncoder(nn.Module):
         champ_embeds = self.champion_embed(champion_ids)
         role_indices = torch.arange(self.num_roles, device=champion_ids.device).unsqueeze(0).expand(batch_size, -1)
         role_embeds = self.role_embed(role_indices)
-        # Keep open slots (id == 0) zeroed out so partial drafts don't inject phantom role bias
         open_mask = (champion_ids != 0).unsqueeze(-1).float()
         return (champ_embeds + role_embeds) * open_mask
 
@@ -243,14 +220,6 @@ class DraftEncoder(nn.Module):
         red_champs: torch.Tensor,
         patch_ids: torch.Tensor = None,
     ) -> torch.Tensor:
-        """
-        Encode a full draft.
-        blue_champs: (batch, 5) — blue team champion IDs [top, jng, mid, bot, sup]
-        red_champs: (batch, 5) — red team champion IDs [top, jng, mid, bot, sup]
-        patch_ids: (batch,) — optional patch indices
-
-        Returns: (batch, draft_dim) — 256-dim draft embedding
-        """
         blue_roles = self.get_role_embeddings(blue_champs)
         red_roles = self.get_role_embeddings(red_champs)
 
@@ -258,13 +227,13 @@ class DraftEncoder(nn.Module):
         blue_vec = self.team_encoder(blue_roles.view(batch_size, -1))
         red_vec = self.team_encoder(red_roles.view(batch_size, -1))
 
-        combined = torch.cat([blue_vec, red_vec], dim=-1)  # (batch, draft_dim * 2)
+        combined = torch.cat([blue_vec, red_vec], dim=-1)
 
         if self.patch_embed is not None and patch_ids is not None:
-            patch_vec = self.patch_embed(patch_ids)  # (batch, patch_dim)
+            patch_vec = self.patch_embed(patch_ids)
             combined = torch.cat([combined, patch_vec], dim=-1)
 
-        base_draft = self.draft_proj(combined)  # (batch, draft_dim)
+        base_draft = self.draft_proj(combined)
 
         if self.matchup_synergy is not None and self.interaction_gate is not None:
             interaction_vec = self.matchup_synergy(blue_roles, red_roles)
@@ -305,7 +274,6 @@ class ObjectiveHead(nn.Module):
     """Predict which team gets first objective (blue/red/none = 3 classes)."""
     def __init__(self, draft_dim: int = 256, hidden: int = 128, num_objectives: int = 4):
         super().__init__()
-        # Separate classifier per objective type
         self.heads = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(draft_dim, hidden), nn.GELU(), nn.Dropout(0.1),
@@ -315,17 +283,14 @@ class ObjectiveHead(nn.Module):
         ])
 
     def forward(self, draft_embed: torch.Tensor) -> list[torch.Tensor]:
-        return [head(draft_embed) for head in self.heads]  # list of (batch, 3)
+        return [head(draft_embed) for head in self.heads]
 
 
 # ── Multi-task model with uncertainty-weighted loss ───────────
 
 class DraftModel(nn.Module):
     """
-    Complete multi-task draft model.
-
-    Combines encoder + 3 output heads with learned loss weights
-    (Kendall et al. 2018 uncertainty weighting).
+    Complete multi-task draft model (Wide & Deep + Kendall uncertainty weighting).
     """
 
     def __init__(
@@ -356,32 +321,53 @@ class DraftModel(nn.Module):
             use_matchup_interactions=use_matchup_interactions,
         )
 
+        # Wide additive role-champion log-odds table (5 roles per champion)
+        # Directly captures per-(champion, role) base strength like role_champion_logistic
+        self.role_champ_bias = nn.Embedding(num_champions, 5, padding_idx=0)
+        nn.init.zeros_(self.role_champ_bias.weight)
+        self.wide_gate = nn.Parameter(torch.tensor(1.0))
+
         self.win_head = WinHead(draft_dim)
         self.gold_head = GoldCurveHead(draft_dim, num_points=num_gold_points)
         self.obj_head = ObjectiveHead(draft_dim, num_objectives=num_objectives)
 
-        # Learned log-variance for uncertainty weighting (Kendall et al. 2018)
-        # Initialize to 0 → weight = exp(0) = 1 for each task
         self.log_var_win = nn.Parameter(torch.zeros(1))
         self.log_var_gold = nn.Parameter(torch.zeros(1))
         self.log_var_obj = nn.Parameter(torch.zeros(1))
 
+    def _compute_wide_logit(self, blue_champs: torch.Tensor, red_champs: torch.Tensor) -> torch.Tensor:
+        """Compute anti-symmetric additive role-champion log-odds: sum_r (b_{blue, r} - b_{red, r})."""
+        # blue_champs, red_champs: (batch, 5)
+        b_table = self.role_champ_bias(blue_champs)  # (batch, 5, 5)
+        r_table = self.role_champ_bias(red_champs)   # (batch, 5, 5)
+        role_idx = torch.arange(5, device=blue_champs.device).view(1, 5, 1)
+        b_role = torch.gather(b_table, 2, role_idx.expand(blue_champs.shape[0], -1, -1)).squeeze(-1)
+        r_role = torch.gather(r_table, 2, role_idx.expand(red_champs.shape[0], -1, -1)).squeeze(-1)
+        return (b_role - r_role).sum(dim=-1)
+
     def load_state_dict(self, state_dict, strict: bool = True):
         """
-        Backward-compatible checkpoint loading: if loading a legacy checkpoint created
-        before MatchupSynergyBlock was added, disable the interaction gate cleanly.
+        Backward-compatible checkpoint loading for checkpoints created before
+        MatchupSynergyBlock or role_champ_bias were added.
         """
         has_interaction_keys = any(k.startswith("encoder.matchup_synergy") for k in state_dict)
-        if not has_interaction_keys and self.encoder.matchup_synergy is not None:
+        has_wide_keys = "role_champ_bias.weight" in state_dict
+        if not has_interaction_keys or not has_wide_keys:
             result = super().load_state_dict(state_dict, strict=False)
             with torch.no_grad():
-                self.encoder.interaction_gate.zero_()
+                if not has_interaction_keys and self.encoder.interaction_gate is not None:
+                    self.encoder.interaction_gate.zero_()
+                if not has_wide_keys:
+                    self.role_champ_bias.weight.zero_()
+                    self.wide_gate.zero_()
             return result
         return super().load_state_dict(state_dict, strict=strict)
 
     def forward(self, blue_champs, red_champs, patch_ids=None):
         draft_embed = self.encoder(blue_champs, red_champs, patch_ids)
-        win_logit = self.win_head(draft_embed)
+        deep_win_logit = self.win_head(draft_embed)
+        wide_win_logit = self._compute_wide_logit(blue_champs, red_champs)
+        win_logit = deep_win_logit + self.wide_gate * wide_win_logit
         gold_pred = self.gold_head(draft_embed)
         obj_preds = self.obj_head(draft_embed)
         return draft_embed, win_logit, gold_pred, obj_preds
@@ -398,15 +384,8 @@ class DraftModel(nn.Module):
         obj_mask: torch.Tensor = None,
         task_weights: dict[str, float] | None = None,
     ) -> dict[str, torch.Tensor]:
-        """
-        Compute uncertainty-weighted multi-task loss.
-
-        Returns dict with 'total', 'win', 'gold', 'obj', and per-task weights.
-        """
-        # Win loss (BCE)
         loss_win = F.binary_cross_entropy_with_logits(win_logit, win_target.float())
 
-        # Gold curve loss (MSE, optionally masked for missing timesteps)
         if gold_mask is not None:
             gold_diff = (gold_pred - gold_target) ** 2
             gold_count = gold_mask.sum()
@@ -415,7 +394,6 @@ class DraftModel(nn.Module):
             gold_count = gold_pred.new_tensor(gold_pred.numel())
             loss_gold = F.mse_loss(gold_pred, gold_target)
 
-        # Objective loss (CE per objective type, averaged)
         obj_losses = []
         for index, (pred, target) in enumerate(zip(obj_preds, obj_targets)):
             if obj_mask is None:
@@ -449,8 +427,6 @@ class DraftModel(nn.Module):
                 "weight_obj": loss_obj.new_tensor(task_weights.get("obj", 0.0)),
             }
 
-        # Uncertainty weighting: L_total = Σ (1/(2σ²)) * L_i + log(σ)
-        # Using log_var = log(σ²), so 1/(2σ²) = 0.5 * exp(-log_var)
         w_win = 0.5 * torch.exp(-self.log_var_win)
         w_gold = 0.5 * torch.exp(-self.log_var_gold)
         w_obj = 0.5 * torch.exp(-self.log_var_obj)

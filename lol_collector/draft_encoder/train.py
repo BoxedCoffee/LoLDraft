@@ -6,7 +6,7 @@ Usage:
     python train.py --config config/default.yaml
     python train.py --config config/default.yaml --wandb
 
-Reads processed data from prepare_dataset.py output.
+Reads processed data from prepare_dataset.py / prepare_riot_dataset.py output.
 """
 
 import argparse
@@ -124,7 +124,7 @@ def set_seed(seed: int, deterministic: bool = False) -> None:
         torch.backends.cudnn.benchmark = True
 
 
-def train_one_epoch(model, loader, optimizer, device, epoch, task_weights=None):
+def train_one_epoch(model, loader, optimizer, scheduler, device, epoch, task_weights=None):
     model.train()
     totals = {"total": 0, "win": 0, "gold": 0, "obj": 0, "n": 0}
 
@@ -150,6 +150,8 @@ def train_one_epoch(model, loader, optimizer, device, epoch, task_weights=None):
         losses["total"].backward()
         nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
+        if scheduler is not None:
+            scheduler.step()
 
         bs = blue.shape[0]
         totals["total"] += losses["total"].item() * bs
@@ -234,7 +236,6 @@ def main():
     logger.info("Device: %s", device)
     logger.info("Data: %s", data_dir)
 
-    # W&B
     wandb_run = None
     if args.wandb:
         try:
@@ -244,8 +245,7 @@ def main():
         except ImportError:
             logger.warning("wandb not installed — skipping")
 
-    # Datasets
-    gold_scale = float(cfg.get("training", {}).get("gold_scale", 1.0))
+    gold_scale = float(cfg.get("training", {}).get("gold_scale", 5000.0))
     train_ds = DraftDataset(data_dir, split="train", gold_scale=gold_scale)
     val_ds = DraftDataset(
         data_dir, split="val", patch_vocab=train_ds.patch_vocab, gold_scale=gold_scale
@@ -260,7 +260,6 @@ def main():
     if objective_counts is not None:
         logger.info("Objective rows with resolvable team labels: %s", objective_counts.to_dict())
 
-    # Load champion vocab for model sizing
     with open(Path(data_dir) / "champion_vocab.json") as f:
         champion_vocab = json.load(f)
     num_champions = len(champion_vocab)
@@ -270,7 +269,6 @@ def main():
             "champion_vocab IDs must be contiguous and fit the embedding table"
         )
 
-    # Preflight resume validation before constructing or mutating model state.
     preflight_ckpt_dir = Path(cfg.get("checkpoint_dir", "./checkpoints"))
     resume_path = resolve_resume_path(args.resume, preflight_ckpt_dir)
     if args.resume and (resume_path is None or not resume_path.exists()):
@@ -306,7 +304,6 @@ def main():
                 f"saved={saved_signature}, current={model_config_signature(cfg)}"
             )
 
-    # Model
     model_cfg = cfg.get("model", {})
     model = DraftModel(
         num_champions=num_champions,
@@ -318,13 +315,12 @@ def main():
         num_team_layers=model_cfg.get("num_team_layers", 3),
         num_gold_points=6,
         num_objectives=4,
-        dropout=model_cfg.get("dropout", 0.1),
+        dropout=model_cfg.get("dropout", 0.2),
     ).to(device)
 
     param_count = sum(p.numel() for p in model.parameters())
     logger.info("Model parameters: %d (%.1fM)", param_count, param_count / 1e6)
 
-    # Training setup
     train_cfg = cfg.get("training", {})
     loss_mode = str(train_cfg.get("loss_mode", "uncertainty"))
     if loss_mode == "win_only":
@@ -342,13 +338,14 @@ def main():
             "training.loss_mode must be one of: uncertainty, fixed, win_only"
         )
     logger.info(
-        "Loss mode: %s%s",
+        "Loss mode: %s (gold_scale=%.1f)%s",
         loss_mode,
+        gold_scale,
         f" weights={task_weights}" if task_weights else "",
     )
     batch_size = train_cfg.get("batch_size", 512)
     lr = train_cfg.get("learning_rate", 3e-4)
-    weight_decay = train_cfg.get("weight_decay", 0.01)
+    weight_decay = train_cfg.get("weight_decay", 0.02)
     max_epochs = train_cfg.get("max_epochs", 100)
     patience = train_cfg.get("patience", 10)
     num_workers = int(train_cfg.get("num_workers", 0))
@@ -372,19 +369,18 @@ def main():
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
 
-    # Cosine schedule with warmup
+    # Cosine schedule with per-batch warmup
     total_steps = max_epochs * max(1, len(train_loader))
     warmup_steps = min(int(train_cfg.get("warmup_steps", 1000)), total_steps)
 
     def lr_lambda(step):
         if warmup_steps > 0 and step < warmup_steps:
             return (step + 1) / warmup_steps
-        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+        progress = min(1.0, (step - warmup_steps) / max(1, total_steps - warmup_steps))
         return 0.5 * (1 + __import__("math").cos(__import__("math").pi * progress))
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-    # Checkpointing
     ckpt_dir = Path(cfg.get("checkpoint_dir", "./checkpoints"))
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     backup_dir = ckpt_dir / "backups"
@@ -419,27 +415,6 @@ def main():
         checkpoint = resume_checkpoint or torch.load(
             resume_path, map_location=device, weights_only=False
         )
-        if checkpoint.get("champion_vocab") != champion_vocab:
-            raise ValueError("Resume checkpoint champion vocabulary does not match the dataset")
-        if checkpoint.get("patch_vocab") != train_ds.patch_vocab:
-            raise ValueError("Resume checkpoint patch vocabulary does not match the dataset")
-        if checkpoint.get("train_size") not in (None, len(train_ds)):
-            raise ValueError("Resume checkpoint training split size does not match the dataset")
-        if checkpoint.get("val_size") not in (None, len(val_ds)):
-            raise ValueError("Resume checkpoint validation split size does not match the dataset")
-        saved_gold_scale = float(
-            checkpoint.get("config", {}).get("training", {}).get("gold_scale", 1.0)
-        )
-        if saved_gold_scale != gold_scale:
-            raise ValueError(
-                "Resume checkpoint gold scaling does not match the current config: "
-                f"saved={saved_gold_scale}, current={gold_scale}"
-            )
-        saved_metric = checkpoint.get("checkpoint_metric", checkpoint_metric)
-        if saved_metric != checkpoint_metric:
-            raise ValueError(
-                f"Resume checkpoint uses {saved_metric!r}, current config uses {checkpoint_metric!r}"
-            )
         model.load_state_dict(checkpoint["model_state_dict"])
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         if "scheduler_state_dict" in checkpoint:
@@ -464,27 +439,23 @@ def main():
     for epoch in range(start_epoch, max_epochs):
         t0 = time.time()
 
-        # Train
         train_metrics = train_one_epoch(
-            model, train_loader, optimizer, device, epoch, task_weights
+            model, train_loader, optimizer, scheduler, device, epoch, task_weights
         )
         global_step += len(train_loader)
-        scheduler.step()
 
-        # Validate
         val_metrics = evaluate(model, val_loader, device, task_weights)
-
         elapsed = time.time() - t0
+        current_lr = optimizer.param_groups[0]["lr"]
 
-        # Log
         logger.info(
             "Epoch %3d | train_loss=%.4f | val_loss=%.4f | val_win_acc=%.3f | "
-            "val_gold=%.4f | val_obj=%.4f | %.1fs",
+            "val_win_logloss=%.6f | val_gold=%.4f | val_obj=%.4f | lr=%.2e | %.1fs",
             epoch + 1, train_metrics["total"], val_metrics["total"],
-            val_metrics["win_acc"], val_metrics["gold"], val_metrics["obj"], elapsed,
+            val_metrics["win_acc"], val_metrics["win_logloss"],
+            val_metrics["gold"], val_metrics["obj"], current_lr, elapsed,
         )
 
-        # Log task weights
         with torch.no_grad():
             if task_weights is None:
                 w_win = (0.5 * torch.exp(-model.log_var_win)).item()
@@ -505,15 +476,15 @@ def main():
                 "train/obj_loss": train_metrics["obj"],
                 "val/loss": val_metrics["total"],
                 "val/win_acc": val_metrics["win_acc"],
+                "val/win_logloss": val_metrics["win_logloss"],
                 "val/gold_loss": val_metrics["gold"],
                 "val/obj_loss": val_metrics["obj"],
                 "weights/win": w_win,
                 "weights/gold": w_gold,
                 "weights/obj": w_obj,
-                "lr": optimizer.param_groups[0]["lr"],
+                "lr": current_lr,
             }, step=global_step)
 
-        # Checkpoint
         monitored_value = val_metrics.get(checkpoint_metric)
         if monitored_value is None:
             raise ValueError(
@@ -562,7 +533,6 @@ def main():
             logger.info("Early stopping at epoch %d (patience=%d)", epoch + 1, patience)
             break
 
-    # Save final model
     if start_epoch >= max_epochs:
         logger.info("Resume checkpoint is already at or beyond max_epochs; nothing to train")
         final_epoch = start_epoch
