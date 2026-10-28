@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Interactive Draft Analyzer focused on pathways to victory."""
+"""Interactive Draft Analyzer focused on pathways to victory and evidence-backed pick/ban advice."""
 
 import json
 import math
@@ -8,19 +8,19 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
+from analysis import (
+    ARCHETYPE_RULES,
+    OBJECTIVES,
+    ROLE_LABELS,
+    ROLES,
+    recommend_bans_from_evidence,
+    recommend_role_candidates,
+)
+
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR.parent / "draft_encoder" / "data" / "processed_riot"
 OUTPUT_DIR = APP_DIR / "analysis_output"
-ROLES = ["top", "jng", "mid", "bot", "sup"]
-ROLE_LABELS = {"top": "Top", "jng": "Jungle", "mid": "Mid", "bot": "Bot", "sup": "Support"}
-OBJECTIVES = ["dragon", "herald", "baron", "tower"]
 OBJECTIVE_LABELS = {"dragon": "Dragon", "herald": "Herald", "baron": "Baron", "tower": "Tower"}
-ARCHETYPE_RULES = {
-    "Engage": {"malphite", "amumu", "leona", "nautilus", "rell", "sejuani", "ornn", "wukong", "jarvan iv", "zac"},
-    "Poke": {"xerath", "ezreal", "jayce", "nidalee", "varus", "karma", "lux", "vel'koz", "zoe"},
-    "Scaling": {"vayne", "nasus", "kayle", "kassadin", "senna", "jinx", "azir", "sivir", "twitch", "gangplank"},
-    "Split push": {"fiora", "tryndamere", "camille", "yorick", "trundle", "jax", "shen"},
-}
 
 st.set_page_config(page_title="LoL Draft Analyzer", page_icon="📊", layout="wide")
 st.markdown(
@@ -224,15 +224,23 @@ def relaxed_matches(
     return table.loc[matched >= required]
 
 
-def classify_team(table: pd.DataFrame, side: str, mapping: dict[str, str]) -> pd.DataFrame:
+def classify_team(table: pd.DataFrame, side: str, mapping: dict[str, str]) -> pd.Series:
+    """Classify each team's primary and secondary composition identity."""
     def classify(row):
         names = [
             mapping.get(str(row[f"{side}_{role}"]), str(row[f"{side}_{role}"])).casefold()
             for role in ROLES
         ]
-        labels = [label for label, champions in ARCHETYPE_RULES.items()
-                  if any(name in champions for name in names)]
-        return ", ".join(labels) if labels else "Balanced / mixed"
+        scored = [
+            (label, sum(1 for name in names if name in champions))
+            for label, champions in ARCHETYPE_RULES.items()
+        ]
+        # Require at least 2 matching champions (or the top non-zero tag) to avoid noisy 4-way ties
+        strong = [label for label, count in sorted(scored, key=lambda x: (-x[1], x[0])) if count >= 2]
+        if strong:
+            return ", ".join(strong[:2])
+        non_zero = [label for label, count in sorted(scored, key=lambda x: (-x[1], x[0])) if count >= 1]
+        return ", ".join(non_zero[:2]) if non_zero else "Balanced / mixed"
 
     return table.apply(classify, axis=1)
 
@@ -261,260 +269,323 @@ def smoothed_rate(series: pd.Series, prior: float, strength: int = 100) -> float
     return float((values.sum() + prior * strength) / (len(values) + strength))
 
 
-table, stats, mapping = load_artifacts()
-all_champions = sorted(
-    set(mapping.values()) if mapping else {
-        str(value) for role in ROLES for side in ("blue", "red")
-        for value in table[f"{side}_{role}"].unique()
-    },
-    key=str.casefold,
-)
+def main() -> None:
+    table, stats, mapping = load_artifacts()
+    all_champions = sorted(
+        set(mapping.values()) if mapping else {
+            str(value) for role in ROLES for side in ("blue", "red")
+            for value in table[f"{side}_{role}"].unique()
+        },
+        key=str.casefold,
+    )
 
-st.markdown(
-    '<div class="hero"><div class="kicker">League of Legends · historical draft research</div>'
-    '<h1>Draft Pathways</h1>'
-    '<p>Explore historical associations between compositions, early gold, objectives, comebacks, and lead conversion.</p></div>',
-    unsafe_allow_html=True,
-)
+    st.markdown(
+        '<div class="hero"><div class="kicker">League of Legends · historical draft research</div>'
+        '<h1>Draft Pathways</h1>'
+        '<p>Explore historical associations between compositions, early gold, objectives, comebacks, lead conversion, and role-aware pick/ban options.</p></div>',
+        unsafe_allow_html=True,
+    )
 
-with st.sidebar:
-    st.header("Build a draft")
-    st.caption(
-        "Pick as many roles as you know. More selections narrow the historical "
-        "comparison; this tool reports associations, not guaranteed outcomes."
-    )
-    comparison_mode = st.selectbox(
-        "Comparison breadth",
-        ["Auto (recommended)", "Role-aware (either side)", "Exact roles & sides", "Champion presence"],
-        help=(
-            "Role-aware comparisons keep the selected lane but allow the champion "
-            "to appear on either team. Champion presence is the broadest mode."
-        ),
-    )
-    minimum_evidence = st.slider(
-        "Minimum evidence",
-        min_value=30,
-        max_value=2000,
-        value=250,
-        step=10,
-        help="Auto mode broadens the comparison until at least this many matches are available.",
-    )
-    patch_options = ["All patches"] + sorted(table["patch"].dropna().astype(str).unique(), reverse=True)
-    selected_patch = st.selectbox("Patch scope", patch_options)
-    if st.button("Clear draft", use_container_width=True):
-        for key in list(st.session_state):
-            if key.startswith(("blue_", "red_")):
-                del st.session_state[key]
-        st.rerun()
-    blue_picks = {}
-    red_picks = {}
-    for role in ROLES:
-        blue_picks[role] = st.selectbox(
-            f"Blue · {ROLE_LABELS[role]}", [""] + all_champions, key=f"blue_{role}"
+    with st.sidebar:
+        st.header("Build a draft")
+        st.caption(
+            "Pick as many roles as you know. More selections narrow the historical "
+            "comparison; this tool reports associations, not guaranteed outcomes."
         )
-        red_picks[role] = st.selectbox(
-            f"Red · {ROLE_LABELS[role]}", [""] + all_champions, key=f"red_{role}"
+        comparison_mode = st.selectbox(
+            "Comparison breadth",
+            ["Auto (recommended)", "Role-aware (either side)", "Exact roles & sides", "Champion presence"],
+            help=(
+                "Role-aware comparisons keep the selected lane but allow the champion "
+                "to appear on either team. Champion presence is the broadest mode."
+            ),
         )
+        minimum_evidence = st.slider(
+            "Minimum evidence",
+            min_value=30,
+            max_value=2000,
+            value=250,
+            step=10,
+            help="Auto mode broadens the comparison until at least this many matches are available.",
+        )
+        patch_options = ["All patches"] + sorted(table["patch"].dropna().astype(str).unique(), reverse=True)
+        selected_patch = st.selectbox("Patch scope", patch_options)
+        if st.button("Clear draft", use_container_width=True):
+            for key in list(st.session_state):
+                if key.startswith(("blue_", "red_")):
+                    del st.session_state[key]
+            st.rerun()
+        blue_picks = {}
+        red_picks = {}
+        for role in ROLES:
+            blue_picks[role] = st.selectbox(
+                f"Blue · {ROLE_LABELS[role]}", [""] + all_champions, key=f"blue_{role}"
+            )
+            red_picks[role] = st.selectbox(
+                f"Red · {ROLE_LABELS[role]}", [""] + all_champions, key=f"red_{role}"
+            )
 
-render_team_card("Blue", blue_picks)
-render_team_card("Red", red_picks)
-selected_count = sum(bool(value) for value in [*blue_picks.values(), *red_picks.values()])
-scoped_table = table if selected_patch == "All patches" else table[table["patch"].astype(str).eq(selected_patch)]
-resolved_mode, similar, matched_picks = resolve_mode(
-    scoped_table, blue_picks, red_picks, comparison_mode, minimum_evidence
-)
-st.caption(f"{selected_count}/10 roles selected · {resolved_mode} · {selected_patch}")
-
-st.subheader("Evidence at a glance")
-overview = st.columns(4)
-overview[0].metric("Dataset", f"{len(table):,} matches")
-overview[1].metric("Patches", f"{table.patch.nunique():,}")
-overview[2].metric("Draft matches", f"{len(similar):,}")
-label, explanation = confidence_label(len(similar))
-overview[3].metric("Evidence", label)
-
-if not selected_count:
-    st.info("Start with one or two champions in the sidebar. The analyzer will compare historical matches using the selected breadth.")
-    st.stop()
-
-with st.expander("Evidence ladder", expanded=False):
-    st.caption("See how much evidence is available before choosing how specific the comparison should be.")
-    st.dataframe(pd.DataFrame(evidence_ladder(scoped_table, blue_picks, red_picks)), hide_index=True, use_container_width=True)
-
-if similar.empty:
-    st.warning(
-        "No historical matches support this comparison. Clear one or two picks, "
-        "or choose a broader comparison mode in the sidebar."
+    render_team_card("Blue", blue_picks)
+    render_team_card("Red", red_picks)
+    selected_count = sum(bool(value) for value in [*blue_picks.values(), *red_picks.values()])
+    scoped_table = table if selected_patch == "All patches" else table[table["patch"].astype(str).eq(selected_patch)]
+    resolved_mode, similar, matched_picks = resolve_mode(
+        scoped_table, blue_picks, red_picks, comparison_mode, minimum_evidence
     )
-    st.stop()
+    st.caption(f"{selected_count}/10 roles selected · {resolved_mode} · {selected_patch}")
 
-st.caption(explanation)
-if comparison_mode == "Auto (recommended)":
-    st.success(f"Auto mode selected **{resolved_mode}** to meet the {minimum_evidence:,}-match evidence target.")
-elif resolved_mode != "Exact roles & sides":
-    st.info(
-        f"This view uses **{comparison_mode.lower()}** to keep the evidence useful. "
-        "It should be read as a composition/role association, not an exact replay of the selected draft."
-    )
-if matched_picks is not None and matched_picks < selected_count:
-    st.warning(
-        f"Only {matched_picks} of {selected_count} selected picks are required in this "
-        "comparison. Add fewer picks or lower the evidence threshold for a more specific view."
-    )
-tabs = st.tabs(["Pathway to victory", "Objective control", "Draft evidence", "Matchups & identity", "Patch context"])
+    st.subheader("Evidence at a glance")
+    overview = st.columns(4)
+    overview[0].metric("Dataset", f"{len(table):,} matches")
+    overview[1].metric("Patches", f"{table.patch.nunique():,}")
+    overview[2].metric("Draft matches", f"{len(similar):,}")
+    label, explanation = confidence_label(len(similar))
+    overview[3].metric("Evidence", label)
 
-with tabs[0]:
-    st.subheader("What happened in comparable matches?")
-    cards = st.columns(4)
-    win_rate = similar.blue_win.mean()
-    win_low, win_high = wilson_interval(similar.blue_win)
-    baseline = scoped_table.blue_win.mean()
-    cards[0].metric(
-        "Observed Blue win rate",
-        pct(win_rate),
-        f"{(win_rate - baseline) * 100:+.1f} pts vs dataset",
-    )
-    cards[1].metric("First Dragon", pct(similar.blue_first_dragon.mean()))
-    cards[2].metric("First Tower", pct(similar.blue_first_tower.mean()))
-    cards[3].metric(
-        "Comeback when behind",
-        pct(similar.loc[~similar.blue_ahead_10, "blue_win"].mean()),
-        help="Among comparable matches where Blue was behind at 10 minutes.",
-    )
-    st.caption(
-        f"Blue win-rate 95% interval: {pct(win_low)}–{pct(win_high)} "
-        f"(dataset baseline: {pct(baseline)})."
-    )
-    st.subheader("Average Blue gold difference")
-    gold = pd.DataFrame(
-        {
-            "Minute": [5, 10, 15, 20, 25, 30],
-            "Gold difference": [
-                similar[f"gold_diff_{minute}"].mean() for minute in (5, 10, 15, 20, 25, 30)
-            ],
-        }
-    ).set_index("Minute")
-    st.line_chart(gold, color="#4b9dff")
-    st.caption("Positive values indicate a Blue-side gold lead. This describes the typical game shape; it does not imply the draft caused it.")
-    ahead = similar.loc[similar.blue_ahead_10, "blue_win"]
-    conversion = ahead.mean()
-    conversion_low, conversion_high = wilson_interval(ahead)
-    st.info(
-        f"When Blue was ahead at 10 minutes in this comparison, it won {pct(conversion)} "
-        f"of those matches (95% interval: {pct(conversion_low)}–{pct(conversion_high)})."
-    )
+    if not selected_count:
+        st.info("Start with one or two champions in the sidebar. The analyzer will compare historical matches using the selected breadth.")
+        st.stop()
 
-with tabs[1]:
-    st.subheader("Who secured the first major objective?")
-    objective_frame = pd.DataFrame(
-        {
-            "Objective": [OBJECTIVE_LABELS[name] for name in OBJECTIVES],
-            "Blue": [similar[f"blue_first_{name}"].mean() for name in OBJECTIVES],
-            "Red": [similar[f"red_first_{name}"].mean() for name in OBJECTIVES],
-        }
-    ).set_index("Objective")
-    st.bar_chart(objective_frame, color=["#4b9dff", "#ff667c"])
-    details = []
-    for objective in OBJECTIVES:
-        available = similar[f"first_{objective}_team"].isin([100, 200]).sum()
-        details.append(
+    with st.expander("Evidence ladder", expanded=False):
+        st.caption("See how much evidence is available before choosing how specific the comparison should be.")
+        st.dataframe(pd.DataFrame(evidence_ladder(scoped_table, blue_picks, red_picks)), hide_index=True, use_container_width=True)
+
+    if similar.empty:
+        st.warning(
+            "No historical matches support this comparison. Clear one or two picks, "
+            "or choose a broader comparison mode in the sidebar."
+        )
+        st.stop()
+
+    st.caption(explanation)
+    if comparison_mode == "Auto (recommended)":
+        st.success(f"Auto mode selected **{resolved_mode}** to meet the {minimum_evidence:,}-match evidence target.")
+    elif resolved_mode != "Exact roles & sides":
+        st.info(
+            f"This view uses **{comparison_mode.lower()}** to keep the evidence useful. "
+            "It should be read as a composition/role association, not an exact replay of the selected draft."
+        )
+    if matched_picks is not None and matched_picks < selected_count:
+        st.warning(
+            f"Only {matched_picks} of {selected_count} selected picks are required in this "
+            "comparison. Add fewer picks or lower the evidence threshold for a more specific view."
+        )
+    tabs = st.tabs([
+        "Pathway to victory",
+        "Objective control",
+        "Draft evidence",
+        "Matchups & identity",
+        "Pick & Ban Advisor",
+        "Patch context",
+    ])
+
+    with tabs[0]:
+        st.subheader("What happened in comparable matches?")
+        cards = st.columns(4)
+        win_rate = similar.blue_win.mean()
+        win_low, win_high = wilson_interval(similar.blue_win)
+        baseline = scoped_table.blue_win.mean()
+        cards[0].metric(
+            "Observed Blue win rate",
+            pct(win_rate),
+            f"{(win_rate - baseline) * 100:+.1f} pts vs dataset",
+        )
+        cards[1].metric("First Dragon", pct(similar.blue_first_dragon.mean()))
+        cards[2].metric("First Tower", pct(similar.blue_first_tower.mean()))
+        cards[3].metric(
+            "Comeback when behind",
+            pct(similar.loc[~similar.blue_ahead_10, "blue_win"].mean()),
+            help="Among comparable matches where Blue was behind at 10 minutes.",
+        )
+        st.caption(
+            f"Blue win-rate 95% interval: {pct(win_low)}–{pct(win_high)} "
+            f"(dataset baseline: {pct(baseline)})."
+        )
+        st.subheader("Average Blue gold difference")
+        gold = pd.DataFrame(
             {
-                "Objective": OBJECTIVE_LABELS[objective],
-                "Blue first": pct(similar[f"blue_first_{objective}"].mean()),
-                "Red first": pct(similar[f"red_first_{objective}"].mean()),
-                "Observed matches": f"{available:,}",
+                "Minute": [5, 10, 15, 20, 25, 30],
+                "Gold difference": [
+                    similar[f"gold_diff_{minute}"].mean() for minute in (5, 10, 15, 20, 25, 30)
+                ],
             }
+        ).set_index("Minute")
+        st.line_chart(gold, color="#4b9dff")
+        st.caption("Positive values indicate a Blue-side gold lead. This describes the typical game shape; it does not imply the draft caused it.")
+        ahead = similar.loc[similar.blue_ahead_10, "blue_win"]
+        conversion = ahead.mean()
+        conversion_low, conversion_high = wilson_interval(ahead)
+        st.info(
+            f"When Blue was ahead at 10 minutes in this comparison, it won {pct(conversion)} "
+            f"of those matches (95% interval: {pct(conversion_low)}–{pct(conversion_high)})."
         )
-    st.dataframe(pd.DataFrame(details), hide_index=True, use_container_width=True)
-    st.caption("Unavailable objective events are excluded from the Blue/Red rates rather than counted as losses.")
-    st.caption(
-        "Rates are shown raw; small samples should be interpreted with the observed-match count above."
-    )
-    st.subheader("Objective value by game state")
-    state_rows = []
-    for objective in OBJECTIVES:
-        available = similar[similar[f"first_{objective}_team"].isin([100, 200])].copy()
-        for state, state_mask in (
-            ("Blue ahead at 10m", available.blue_ahead_10),
-            ("Blue behind at 10m", ~available.blue_ahead_10),
-        ):
-            state_frame = available.loc[state_mask]
-            state_rows.append({
-                "Objective": OBJECTIVE_LABELS[objective],
-                "State": state,
-                "Matches": len(state_frame),
-                "Blue first": pct(state_frame[f"blue_first_{objective}"].mean()),
-                "Blue win if first": pct(
-                    state_frame.loc[state_frame[f"blue_first_{objective}"], "blue_win"].mean()
-                ),
-            })
-    st.dataframe(pd.DataFrame(state_rows), hide_index=True, use_container_width=True)
-    st.caption("This is conditional association: it does not prove that securing an objective caused the win.")
 
-with tabs[2]:
-    st.subheader("How much evidence supports this view?")
-    st.write(
-        "The table below shows the selected champions in their selected roles. "
-        "The comparison is intentionally exact by side and role, so adding picks can reduce the sample quickly."
-    )
-    selected_rows = []
-    for team, picks in (("Blue", blue_picks), ("Red", red_picks)):
-        for role, champion in picks.items():
-            if champion:
-                row = stats[(stats.role == role) & (stats.champion == champion)]
-                selected_rows.append(
-                    {
-                        "Side": team,
-                        "Role": ROLE_LABELS[role],
-                        "Champion": champion,
-                        "Historical picks": int(row.matches.iloc[0]) if not row.empty else 0,
-                        "Role win rate": pct(row.win_rate.iloc[0]) if not row.empty else "Unavailable",
-                        "Avg gold diff at 10m": round(float(row.mean_gold_diff_10.iloc[0]), 1) if not row.empty else None,
-                    }
-                )
-    st.dataframe(pd.DataFrame(selected_rows), hide_index=True, use_container_width=True)
-    conversion = similar.loc[similar.blue_ahead_10, "blue_win"]
-    st.metric(
-        "Blue lead conversion at 10 minutes",
-        pct(smoothed_rate(conversion, scoped_table.blue_win.mean())),
-        help="A lightly smoothed estimate shrinks very small samples toward the full-dataset baseline.",
-    )
-
-with tabs[3]:
-    st.subheader("Lane matchup evidence")
-    matchup = matchup_evidence(scoped_table, blue_picks, red_picks)
-    if matchup.empty:
-        st.info("Select both Blue and Red champions in at least one shared role to compare a lane matchup.")
-    else:
-        st.dataframe(matchup, hide_index=True, use_container_width=True)
-        st.caption("Matchup rows use exact Blue-versus-Red role assignments and may be sparse independently of the broader comparison.")
-
-    st.subheader("Composition identity")
-    for side in ("blue", "red"):
-        classified = classify_team(similar, side, mapping)
-        counts = classified.value_counts().rename_axis("Observed archetype mix").reset_index(name="Matches")
-        counts["Share"] = counts["Matches"] / len(similar)
-        st.write(f"{side.title()} archetype indicators")
-        st.dataframe(counts, hide_index=True, use_container_width=True)
-    st.caption("Archetypes are transparent champion-pool indicators, not expert labels or causal explanations.")
-
-with tabs[4]:
-    st.subheader("How does the broader meta move?")
-    patch_summary = (
-        scoped_table.groupby("patch", as_index=False)
-        .agg(
-            matches=("match_id", "size"),
-            blue_win_rate=("blue_win", "mean"),
-            gold_diff_10=("gold_diff_10", "mean"),
-            first_dragon=("blue_first_dragon", "mean"),
-            first_tower=("blue_first_tower", "mean"),
+    with tabs[1]:
+        st.subheader("Who secured the first major objective?")
+        objective_frame = pd.DataFrame(
+            {
+                "Objective": [OBJECTIVE_LABELS[name] for name in OBJECTIVES],
+                "Blue": [similar[f"blue_first_{name}"].mean() for name in OBJECTIVES],
+                "Red": [similar[f"red_first_{name}"].mean() for name in OBJECTIVES],
+            }
+        ).set_index("Objective")
+        st.bar_chart(objective_frame, color=["#4b9dff", "#ff667c"])
+        details = []
+        for objective in OBJECTIVES:
+            available = similar[f"first_{objective}_team"].isin([100, 200]).sum()
+            details.append(
+                {
+                    "Objective": OBJECTIVE_LABELS[objective],
+                    "Blue first": pct(similar[f"blue_first_{objective}"].mean()),
+                    "Red first": pct(similar[f"red_first_{objective}"].mean()),
+                    "Observed matches": f"{available:,}",
+                }
+            )
+        st.dataframe(pd.DataFrame(details), hide_index=True, use_container_width=True)
+        st.caption("Unavailable objective events are excluded from the Blue/Red rates rather than counted as losses.")
+        st.caption(
+            "Rates are shown raw; small samples should be interpreted with the observed-match count above."
         )
-        .sort_values("patch")
-    )
-    chart = patch_summary.set_index("patch")[["blue_win_rate", "first_dragon", "first_tower"]]
-    st.line_chart(chart)
-    st.dataframe(patch_summary, hide_index=True, use_container_width=True)
-    st.caption("Patch context follows the selected patch scope. Select All patches to see the full meta trend.")
+        st.subheader("Objective value by game state")
+        state_rows = []
+        for objective in OBJECTIVES:
+            available = similar[similar[f"first_{objective}_team"].isin([100, 200])].copy()
+            for state, state_mask in (
+                ("Blue ahead at 10m", available.blue_ahead_10),
+                ("Blue behind at 10m", ~available.blue_ahead_10),
+            ):
+                state_frame = available.loc[state_mask]
+                state_rows.append({
+                    "Objective": OBJECTIVE_LABELS[objective],
+                    "State": state,
+                    "Matches": len(state_frame),
+                    "Blue first": pct(state_frame[f"blue_first_{objective}"].mean()),
+                    "Blue win if first": pct(
+                        state_frame.loc[state_frame[f"blue_first_{objective}"], "blue_win"].mean()
+                    ),
+                })
+        st.dataframe(pd.DataFrame(state_rows), hide_index=True, use_container_width=True)
+        st.caption("This is conditional association: it does not prove that securing an objective caused the win.")
 
-st.divider()
-st.caption("Research note: these are historical associations among comparable matches. They are not causal claims, betting advice, or guaranteed predictions.")
+    with tabs[2]:
+        st.subheader("How much evidence supports this view?")
+        st.write(
+            "The table below shows the selected champions in their selected roles. "
+            "The comparison is intentionally exact by side and role, so adding picks can reduce the sample quickly."
+        )
+        selected_rows = []
+        for team, picks in (("Blue", blue_picks), ("Red", red_picks)):
+            for role, champion in picks.items():
+                if champion:
+                    row = stats[(stats.role == role) & (stats.champion == champion)]
+                    selected_rows.append(
+                        {
+                            "Side": team,
+                            "Role": ROLE_LABELS[role],
+                            "Champion": champion,
+                            "Historical picks": int(row.matches.iloc[0]) if not row.empty else 0,
+                            "Role win rate": pct(row.win_rate.iloc[0]) if not row.empty else "Unavailable",
+                            "Avg gold diff at 10m": round(float(row.mean_gold_diff_10.iloc[0]), 1) if not row.empty else None,
+                        }
+                    )
+        st.dataframe(pd.DataFrame(selected_rows), hide_index=True, use_container_width=True)
+        conversion = similar.loc[similar.blue_ahead_10, "blue_win"]
+        st.metric(
+            "Blue lead conversion at 10 minutes",
+            pct(smoothed_rate(conversion, scoped_table.blue_win.mean())),
+            help="A lightly smoothed estimate shrinks very small samples toward the full-dataset baseline.",
+        )
+
+    with tabs[3]:
+        st.subheader("Lane matchup evidence")
+        matchup = matchup_evidence(scoped_table, blue_picks, red_picks)
+        if matchup.empty:
+            st.info("Select both Blue and Red champions in at least one shared role to compare a lane matchup.")
+        else:
+            st.dataframe(matchup, hide_index=True, use_container_width=True)
+            st.caption("Matchup rows use exact Blue-versus-Red role assignments and may be sparse independently of the broader comparison.")
+
+        st.subheader("Composition identity")
+        for side in ("blue", "red"):
+            classified = classify_team(similar, side, mapping)
+            counts = classified.value_counts().rename_axis("Observed archetype mix").reset_index(name="Matches")
+            counts["Share"] = counts["Matches"] / len(similar)
+            st.write(f"{side.title()} archetype indicators")
+            st.dataframe(counts, hide_index=True, use_container_width=True)
+        st.caption("Archetypes are transparent 172-champion strategic taxonomy indicators, not causal explanations.")
+
+    with tabs[4]:
+        st.subheader("Evidence-Based Pick & Ban Advisor")
+        st.caption(
+            "Ranks candidate picks for open roles and high-threat bans for remaining enemy roles "
+            "using Bayesian-smoothed role win rates, comparable-draft synergy, and head-to-head lane matchups."
+        )
+        advisor_col1, advisor_col2 = st.columns([1, 2])
+        with advisor_col1:
+            advisor_side = st.radio("Recommend for side", ["Blue", "Red"], horizontal=True)
+            side_key = advisor_side.lower()
+            own_picks = blue_picks if side_key == "blue" else red_picks
+            open_roles = [r for r in ROLES if not own_picks.get(r)]
+            selected_open_role = st.selectbox(
+                "Target open role",
+                open_roles if open_roles else ROLES,
+                format_func=lambda r: f"{ROLE_LABELS[r]} {'(open)' if r in open_roles else '(filled)'}",
+            )
+
+        pick_candidates = recommend_role_candidates(
+            scoped_table=scoped_table,
+            similar_table=similar,
+            stats=stats,
+            blue_picks=blue_picks,
+            red_picks=red_picks,
+            target_side=side_key,
+            target_role=selected_open_role,
+            min_role_matches=15,
+            top_k=8,
+        )
+        st.markdown(f"#### Top Pick Candidates · {advisor_side} {ROLE_LABELS[selected_open_role]}")
+        if pick_candidates.empty:
+            st.info("No candidate champions meet the minimum role sample threshold.")
+        else:
+            st.dataframe(pick_candidates, hide_index=True, use_container_width=True)
+
+        ban_candidates = recommend_bans_from_evidence(
+            scoped_table=scoped_table,
+            similar_table=similar,
+            stats=stats,
+            blue_picks=blue_picks,
+            red_picks=red_picks,
+            target_side=side_key,
+            min_role_matches=25,
+            top_k=5,
+        )
+        st.markdown(f"#### Top Ban Recommendations · Target Remaining Enemy Open Roles")
+        if ban_candidates.empty:
+            st.info("No ban candidates available for the remaining enemy roles.")
+        else:
+            st.dataframe(ban_candidates, hide_index=True, use_container_width=True)
+
+    with tabs[5]:
+        st.subheader("How does the broader meta move?")
+        patch_summary = (
+            scoped_table.groupby("patch", as_index=False)
+            .agg(
+                matches=("match_id", "size"),
+                blue_win_rate=("blue_win", "mean"),
+                gold_diff_10=("gold_diff_10", "mean"),
+                first_dragon=("blue_first_dragon", "mean"),
+                first_tower=("blue_first_tower", "mean"),
+            )
+            .sort_values("patch")
+        )
+        chart = patch_summary.set_index("patch")[["blue_win_rate", "first_dragon", "first_tower"]]
+        st.line_chart(chart)
+        st.dataframe(patch_summary, hide_index=True, use_container_width=True)
+        st.caption("Patch context follows the selected patch scope. Select All patches to see the full meta trend.")
+
+    st.divider()
+    st.caption("Research note: these are historical associations among comparable matches. They are not causal claims, betting advice, or guaranteed predictions.")
+
+
+if __name__ == "__main__":
+    main()

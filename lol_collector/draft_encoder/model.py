@@ -4,8 +4,10 @@ Draft encoder model.
 Architecture:
   Champion ID → 64-dim embedding (role-aware via positional encoding)
   5 champion embeds per team → concat (320) → 3-layer MLP (512, residual) → 256-dim team vector
-  Blue team vec + Red team vec → concat (512) → project → 256-dim draft embedding
-  + Optional patch embedding (16-dim) concatenated before output heads
+  Cross-team Lane Matchup & Intra-Team Synergy block:
+    - Explicit lane matchup diffs (blue_role - red_role) and Hadamard products (blue_role * red_role)
+    - Intra-team pairwise role synergy interactions (10 pairs per side)
+  Blue team vec + Red team vec (+ optional patch embed) → project + gated interaction residual → 256-dim draft embedding
 
 Output heads (multi-task):
   1. Win prediction: BCE
@@ -58,6 +60,81 @@ class TeamEncoder(nn.Module):
         return self.output_proj(h)
 
 
+class MatchupSynergyBlock(nn.Module):
+    """
+    Explicitly encodes role-aligned lane matchups (blue_role vs red_role) and
+    intra-team pairwise synergies across the 10 role pairs per team.
+    """
+
+    def __init__(self, champion_dim: int = 64, num_roles: int = 5, output_dim: int = 256, dropout: float = 0.1):
+        super().__init__()
+        self.champion_dim = champion_dim
+        self.num_roles = num_roles
+        # Pair indices for C(num_roles, 2) = 10 intra-team pairs
+        pairs = [(i, j) for i in range(num_roles) for j in range(i + 1, num_roles)]
+        self.register_buffer(
+            "pair_left", torch.tensor([p[0] for p in pairs], dtype=torch.long), persistent=False
+        )
+        self.register_buffer(
+            "pair_right", torch.tensor([p[1] for p in pairs], dtype=torch.long), persistent=False
+        )
+
+        # Features:
+        #   1) 5 lane diffs (blue_r - red_r): num_roles * champion_dim
+        #   2) 5 lane Hadamard products (blue_r * red_r): num_roles * champion_dim
+        #   3) Mean intra-team pairwise Hadamard for Blue + Red: 2 * champion_dim
+        #   4) Pairwise scaled dot products (10 for Blue + 10 for Red + 5 lane dots): 2 * len(pairs) + num_roles
+        num_pairs = len(pairs)
+        in_features = (2 * num_roles * champion_dim) + (2 * champion_dim) + (2 * num_pairs + num_roles)
+
+        self.proj = nn.Sequential(
+            nn.Linear(in_features, output_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(output_dim, output_dim),
+            nn.LayerNorm(output_dim),
+        )
+
+    def forward(self, blue_roles: torch.Tensor, red_roles: torch.Tensor) -> torch.Tensor:
+        """
+        blue_roles, red_roles: (batch, 5, champion_dim)
+        Returns: (batch, output_dim)
+        """
+        batch_size = blue_roles.shape[0]
+        scale = self.champion_dim ** -0.5
+
+        # 1. Role-aligned lane matchup interactions
+        lane_diff = (blue_roles - red_roles).reshape(batch_size, -1)
+        lane_prod = (blue_roles * red_roles).reshape(batch_size, -1)
+        lane_dots = (blue_roles * red_roles).sum(dim=-1) * scale  # (batch, 5)
+
+        # 2. Intra-team pairwise synergies (10 role pairs per team)
+        b_left = blue_roles[:, self.pair_left, :]
+        b_right = blue_roles[:, self.pair_right, :]
+        r_left = red_roles[:, self.pair_left, :]
+        r_right = red_roles[:, self.pair_right, :]
+
+        blue_pair_prod = (b_left * b_right).mean(dim=1)  # (batch, champion_dim)
+        red_pair_prod = (r_left * r_right).mean(dim=1)   # (batch, champion_dim)
+
+        blue_pair_dots = (b_left * b_right).sum(dim=-1) * scale  # (batch, 10)
+        red_pair_dots = (r_left * r_right).sum(dim=-1) * scale   # (batch, 10)
+
+        features = torch.cat(
+            [
+                lane_diff,
+                lane_prod,
+                blue_pair_prod,
+                red_pair_prod,
+                lane_dots,
+                blue_pair_dots,
+                red_pair_dots,
+            ],
+            dim=-1,
+        )
+        return self.proj(features)
+
+
 class DraftEncoder(nn.Module):
     """
     Full draft encoder: 10 champion IDs → 256-dim draft embedding.
@@ -72,6 +149,7 @@ class DraftEncoder(nn.Module):
         patch_dim: patch embedding dimension
         num_team_layers: depth of team MLP
         dropout: dropout rate
+        use_matchup_interactions: whether to add explicit lane matchup & pairwise synergy block
     """
 
     def __init__(
@@ -85,9 +163,12 @@ class DraftEncoder(nn.Module):
         patch_dim: int = 16,
         num_team_layers: int = 3,
         dropout: float = 0.1,
+        use_matchup_interactions: bool = True,
     ):
         super().__init__()
         self.draft_dim = draft_dim
+        self.num_roles = num_roles
+        self.use_matchup_interactions = use_matchup_interactions
 
         # Champion embeddings (shared across both teams)
         self.champion_embed = nn.Embedding(num_champions, champion_dim, padding_idx=0)
@@ -119,21 +200,40 @@ class DraftEncoder(nn.Module):
             nn.LayerNorm(draft_dim),
         )
 
+        if use_matchup_interactions:
+            self.matchup_synergy = MatchupSynergyBlock(
+                champion_dim=champion_dim,
+                num_roles=num_roles,
+                output_dim=draft_dim,
+                dropout=dropout,
+            )
+            self.interaction_gate = nn.Parameter(torch.tensor(0.5))
+            self.out_norm = nn.LayerNorm(draft_dim)
+        else:
+            self.matchup_synergy = None
+            self.interaction_gate = None
+            self.out_norm = None
+
+    def get_role_embeddings(self, champion_ids: torch.Tensor) -> torch.Tensor:
+        """
+        Compute role-aware embeddings for one team's 5 champions.
+        Returns: (batch, 5, champion_dim)
+        """
+        batch_size = champion_ids.shape[0]
+        champ_embeds = self.champion_embed(champion_ids)
+        role_indices = torch.arange(self.num_roles, device=champion_ids.device).unsqueeze(0).expand(batch_size, -1)
+        role_embeds = self.role_embed(role_indices)
+        # Keep open slots (id == 0) zeroed out so partial drafts don't inject phantom role bias
+        open_mask = (champion_ids != 0).unsqueeze(-1).float()
+        return (champ_embeds + role_embeds) * open_mask
+
     def encode_team(self, champion_ids: torch.Tensor) -> torch.Tensor:
         """
         Encode one team's 5 champions.
         champion_ids: (batch, 5) — integer champion IDs ordered by role
         """
         batch_size = champion_ids.shape[0]
-        # (batch, 5, champion_dim)
-        champ_embeds = self.champion_embed(champion_ids)
-
-        # Add role positional encoding
-        role_indices = torch.arange(5, device=champion_ids.device).unsqueeze(0).expand(batch_size, -1)
-        role_embeds = self.role_embed(role_indices)
-        combined = champ_embeds + role_embeds
-
-        # Flatten: (batch, 5 * champion_dim)
+        combined = self.get_role_embeddings(champion_ids)
         flat = combined.view(batch_size, -1)
         return self.team_encoder(flat)
 
@@ -151,8 +251,12 @@ class DraftEncoder(nn.Module):
 
         Returns: (batch, draft_dim) — 256-dim draft embedding
         """
-        blue_vec = self.encode_team(blue_champs)  # (batch, draft_dim)
-        red_vec = self.encode_team(red_champs)     # (batch, draft_dim)
+        blue_roles = self.get_role_embeddings(blue_champs)
+        red_roles = self.get_role_embeddings(red_champs)
+
+        batch_size = blue_champs.shape[0]
+        blue_vec = self.team_encoder(blue_roles.view(batch_size, -1))
+        red_vec = self.team_encoder(red_roles.view(batch_size, -1))
 
         combined = torch.cat([blue_vec, red_vec], dim=-1)  # (batch, draft_dim * 2)
 
@@ -160,7 +264,13 @@ class DraftEncoder(nn.Module):
             patch_vec = self.patch_embed(patch_ids)  # (batch, patch_dim)
             combined = torch.cat([combined, patch_vec], dim=-1)
 
-        return self.draft_proj(combined)  # (batch, draft_dim)
+        base_draft = self.draft_proj(combined)  # (batch, draft_dim)
+
+        if self.matchup_synergy is not None and self.interaction_gate is not None:
+            interaction_vec = self.matchup_synergy(blue_roles, red_roles)
+            return self.out_norm(base_draft + self.interaction_gate * interaction_vec)
+
+        return base_draft
 
 
 # ── Output Heads ──────────────────────────────────────────────
@@ -230,6 +340,7 @@ class DraftModel(nn.Module):
         num_gold_points: int = 6,
         num_objectives: int = 4,
         dropout: float = 0.1,
+        use_matchup_interactions: bool = True,
     ):
         super().__init__()
 
@@ -242,6 +353,7 @@ class DraftModel(nn.Module):
             team_hidden=team_hidden,
             num_team_layers=num_team_layers,
             dropout=dropout,
+            use_matchup_interactions=use_matchup_interactions,
         )
 
         self.win_head = WinHead(draft_dim)
@@ -253,6 +365,19 @@ class DraftModel(nn.Module):
         self.log_var_win = nn.Parameter(torch.zeros(1))
         self.log_var_gold = nn.Parameter(torch.zeros(1))
         self.log_var_obj = nn.Parameter(torch.zeros(1))
+
+    def load_state_dict(self, state_dict, strict: bool = True):
+        """
+        Backward-compatible checkpoint loading: if loading a legacy checkpoint created
+        before MatchupSynergyBlock was added, disable the interaction gate cleanly.
+        """
+        has_interaction_keys = any(k.startswith("encoder.matchup_synergy") for k in state_dict)
+        if not has_interaction_keys and self.encoder.matchup_synergy is not None:
+            result = super().load_state_dict(state_dict, strict=False)
+            with torch.no_grad():
+                self.encoder.interaction_gate.zero_()
+            return result
+        return super().load_state_dict(state_dict, strict=strict)
 
     def forward(self, blue_champs, red_champs, patch_ids=None):
         draft_embed = self.encoder(blue_champs, red_champs, patch_ids)

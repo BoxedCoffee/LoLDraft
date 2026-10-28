@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """
-KNN-based recommendation engine for draft picks and bans.
+Role-aware, KNN-based recommendation engine for draft picks and bans.
+Supports explicit target roles, automatic open-slot detection, lane-counter
+matchup weighting, and top-K ranked candidate lists.
+Works with scikit-learn + PyTorch when installed, or falls back to pure NumPy/Pandas.
 """
 
 from collections import defaultdict
@@ -11,20 +14,90 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-from sklearn.neighbors import NearestNeighbors
-from sklearn.preprocessing import StandardScaler
-import torch
 
-from lol_collector.draft_encoder.model import DraftModel
+try:
+    from sklearn.neighbors import NearestNeighbors
+    from sklearn.preprocessing import StandardScaler
+    HAS_SKLEARN = True
+except ImportError:
+    HAS_SKLEARN = False
+
+try:
+    import torch
+    from lol_collector.draft_encoder.model import DraftModel
+    HAS_TORCH = True
+except ImportError:
+    torch = None
+    DraftModel = None
+    HAS_TORCH = False
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("recommendation_engine")
 
 ROLES = ["top", "jng", "mid", "bot", "sup"]
+ROLE_ALIASES = {
+    "top": "top",
+    "jng": "jng",
+    "jungle": "jng",
+    "mid": "mid",
+    "middle": "mid",
+    "bot": "bot",
+    "bottom": "bot",
+    "adc": "bot",
+    "sup": "sup",
+    "support": "sup",
+    "utility": "sup",
+}
+
+
+class _NumpyScaler:
+    """Lightweight StandardScaler equivalent when scikit-learn is unavailable."""
+
+    def __init__(self):
+        self.mean_ = None
+        self.scale_ = None
+
+    def fit_transform(self, x: np.ndarray) -> np.ndarray:
+        self.mean_ = np.mean(x, axis=0)
+        std = np.std(x, axis=0)
+        self.scale_ = np.where(std > 1e-8, std, 1.0)
+        return (x - self.mean_) / self.scale_
+
+    def transform(self, x: np.ndarray) -> np.ndarray:
+        return (x - self.mean_) / self.scale_
+
+
+class _NumpyCosineKNN:
+    """Lightweight cosine-distance NearestNeighbors equivalent."""
+
+    def __init__(self, n_neighbors: int = 20):
+        self.n_neighbors = n_neighbors
+        self._normed = None
+
+    def fit(self, x: np.ndarray):
+        norms = np.linalg.norm(x, axis=1, keepdims=True)
+        self._normed = x / np.where(norms > 1e-12, norms, 1.0)
+        return self
+
+    def kneighbors(self, query: np.ndarray, n_neighbors: int = 10) -> Tuple[np.ndarray, np.ndarray]:
+        q_norms = np.linalg.norm(query, axis=1, keepdims=True)
+        q_normed = query / np.where(q_norms > 1e-12, q_norms, 1.0)
+        sims = q_normed @ self._normed.T
+        dists = 1.0 - sims
+        k = min(n_neighbors, self._normed.shape[0])
+        order = np.argsort(dists, axis=1)[:, :k]
+        sorted_dists = np.take_along_axis(dists, order, axis=1)
+        return sorted_dists, order
+
+
+def normalize_role_name(role: Optional[str]) -> Optional[str]:
+    if not role:
+        return None
+    return ROLE_ALIASES.get(str(role).strip().casefold())
 
 
 class DraftRecommendationEngine:
-    """KNN-based draft recommendation engine."""
+    """Role-aware KNN draft recommendation engine."""
 
     def __init__(
         self,
@@ -34,20 +107,20 @@ class DraftRecommendationEngine:
         data_dir: str = "./data/processed",
         device: str = "cpu",
     ):
-        self.device = torch.device(device)
+        self.device = torch.device(device) if HAS_TORCH else device
         self.model_path = Path(model_path)
         self.embedding_dir = Path(embedding_dir)
         self.clustering_dir = Path(clustering_dir)
         self.data_dir = Path(data_dir)
 
-        self.model: Optional[DraftModel] = None
+        self.model = None
         self.id_to_name: Dict[int, str] = {}
         self.draft_lookup: Dict[str, dict] = {}
 
         self.load_model_and_embeddings()
 
         self.knn_model = None
-        self.scaler = StandardScaler()
+        self.scaler = StandardScaler() if HAS_SKLEARN else _NumpyScaler()
         self.initialize_recommendation_system()
 
     def _load_id_to_name_mapping(self) -> Dict[int, str]:
@@ -106,6 +179,10 @@ class DraftRecommendationEngine:
 
         # Load draft compositions so KNN neighbor matches can be inspected
         drafts_path = self.data_dir / "drafts.parquet"
+        if not drafts_path.exists():
+            alt_path = Path("lol_collector/draft_encoder/data/processed_riot/drafts.parquet")
+            if alt_path.exists():
+                drafts_path = alt_path
         if drafts_path.exists():
             try:
                 drafts_df = pd.read_parquet(drafts_path)
@@ -115,7 +192,7 @@ class DraftRecommendationEngine:
                 logger.warning("Could not read drafts.parquet (%s); using embedding fallback", exc)
 
         # Load trained DraftModel checkpoint if available
-        if self.model_path.exists():
+        if HAS_TORCH and self.model_path.exists():
             try:
                 ckpt = torch.load(self.model_path, map_location=self.device, weights_only=False)
                 champion_vocab = ckpt["champion_vocab"]
@@ -144,38 +221,69 @@ class DraftRecommendationEngine:
         logger.info("Initializing recommendation system...")
         self.embeddings_scaled = self.scaler.fit_transform(self.embeddings)
         n_neighbors = min(20, len(self.embeddings))
-        self.knn_model = NearestNeighbors(
-            n_neighbors=n_neighbors, metric="cosine", algorithm="auto"
-        )
+        if HAS_SKLEARN:
+            self.knn_model = NearestNeighbors(
+                n_neighbors=n_neighbors, metric="cosine", algorithm="auto"
+            )
+        else:
+            self.knn_model = _NumpyCosineKNN(n_neighbors=n_neighbors)
         self.knn_model.fit(self.embeddings_scaled)
         logger.info("Recommendation system initialized")
 
-    def _pad_team(self, champs: List[int]) -> List[int]:
+    def _pad_team(self, champs: List[int] | Dict[str, int]) -> List[int]:
+        """Convert a role dict or list of up to 5 champion IDs into [top, jng, mid, bot, sup]."""
+        if isinstance(champs, dict):
+            return [int(champs.get(r, 0) or 0) for r in ROLES]
         padded = [int(c) for c in champs[:5]]
         padded.extend([0] * (5 - len(padded)))
         return padded
 
-    def get_draft_embedding(self, blue_champs: List[int], red_champs: List[int]) -> np.ndarray:
+    def _resolve_candidate_roles(
+        self, padded_team: List[int], target_role: Optional[str] = None
+    ) -> Tuple[List[str], str]:
+        """
+        Determine which role(s) should be evaluated for a pick/ban.
+        Returns (candidate_roles, primary_role).
+        """
+        norm = normalize_role_name(target_role)
+        if norm in ROLES:
+            return [norm], norm
+
+        open_roles = [ROLES[idx] for idx, cid in enumerate(padded_team) if int(cid) == 0]
+        if open_roles:
+            return open_roles, open_roles[0]
+        return list(ROLES), ROLES[0]
+
+    def get_draft_embedding(
+        self, blue_champs: List[int] | Dict[str, int], red_champs: List[int] | Dict[str, int]
+    ) -> np.ndarray:
         """Compute embedding using the trained encoder, or average matching historical drafts."""
         blue_padded = self._pad_team(blue_champs)
         red_padded = self._pad_team(red_champs)
 
-        if self.model is not None:
+        if HAS_TORCH and self.model is not None:
             with torch.no_grad():
                 blue_t = torch.tensor([blue_padded], dtype=torch.long, device=self.device)
                 red_t = torch.tensor([red_padded], dtype=torch.long, device=self.device)
                 patch_t = torch.tensor([0], dtype=torch.long, device=self.device)
                 return self.model.get_embedding(blue_t, red_t, patch_t).cpu().numpy()[0]
 
-        # Deterministic fallback when no checkpoint is loaded: average embeddings of
-        # historical drafts sharing the selected champions.
         selected = {c for c in blue_padded + red_padded if c > 0}
         if self.draft_lookup and selected:
-            matching_indices = []
+            role_matching_indices = []
+            presence_matching_indices = []
             for idx, mid in enumerate(self.match_ids):
                 row = self.draft_lookup.get(str(mid))
                 if not row:
                     continue
+                exact_role_hits = sum(
+                    1
+                    for r_idx, r in enumerate(ROLES)
+                    if (blue_padded[r_idx] > 0 and int(row.get(f"blue_{r}", 0)) == blue_padded[r_idx])
+                    or (red_padded[r_idx] > 0 and int(row.get(f"red_{r}", 0)) == red_padded[r_idx])
+                )
+                if exact_role_hits > 0:
+                    role_matching_indices.append(idx)
                 row_champs = {
                     int(row[f"{side}_{r}"])
                     for side in ("blue", "red")
@@ -183,9 +291,11 @@ class DraftRecommendationEngine:
                     if f"{side}_{r}" in row
                 }
                 if selected & row_champs:
-                    matching_indices.append(idx)
-            if matching_indices:
-                return np.mean(self.embeddings[matching_indices], axis=0)
+                    presence_matching_indices.append(idx)
+            if role_matching_indices:
+                return np.mean(self.embeddings[role_matching_indices], axis=0)
+            if presence_matching_indices:
+                return np.mean(self.embeddings[presence_matching_indices], axis=0)
 
         return np.mean(self.embeddings, axis=0)
 
@@ -205,18 +315,31 @@ class DraftRecommendationEngine:
 
     def recommend_pick(
         self,
-        team_champs: List[int],
-        opposing_team_champs: List[int],
+        team_champs: List[int] | Dict[str, int],
+        opposing_team_champs: List[int] | Dict[str, int],
         archetype_preference: str = "any",
+        target_role: Optional[str] = None,
+        top_k: int = 5,
     ) -> Dict:
-        """Recommend a champion pick for the given team using similarity-weighted win rates."""
-        logger.info(f"Generating recommendation for team {team_champs}")
-        target_embedding = self.get_draft_embedding(team_champs, opposing_team_champs)
+        """
+        Recommend champion pick(s) for the given team using role-aware similarity-weighted
+        win rates and lane-matchup counter evidence.
+        """
+        blue_padded = self._pad_team(team_champs)
+        red_padded = self._pad_team(opposing_team_champs)
+        candidate_roles, primary_role = self._resolve_candidate_roles(blue_padded, target_role)
+
+        logger.info(
+            "Generating pick recommendation for team %s (roles=%s)",
+            blue_padded,
+            candidate_roles,
+        )
+        target_embedding = self.get_draft_embedding(blue_padded, red_padded)
         similar_drafts = self.find_similar_drafts(target_embedding, n_similar=50)
 
-        excluded = {int(c) for c in team_champs + opposing_team_champs if int(c) > 0}
-        champ_scores: Dict[int, float] = defaultdict(float)
-        champ_weights: Dict[int, float] = defaultdict(float)
+        excluded = {int(c) for c in blue_padded + red_padded if int(c) > 0}
+        champ_scores: Dict[Tuple[int, str], float] = defaultdict(float)
+        champ_weights: Dict[Tuple[int, str], float] = defaultdict(float)
         archetype_votes: Dict[str, float] = defaultdict(float)
 
         for match_id, similarity, idx in similar_drafts:
@@ -228,12 +351,16 @@ class DraftRecommendationEngine:
             win = float(self.win_labels[idx])
             row = self.draft_lookup.get(match_id)
             if row:
-                for role in ROLES:
+                for role in candidate_roles:
+                    r_idx = ROLES.index(role)
                     cid = int(row.get(f"blue_{role}", 0))
                     if cid > 0 and cid not in excluded:
                         weight = max(similarity, 1e-3)
-                        champ_scores[cid] += weight * (0.6 * win + 0.4)
-                        champ_weights[cid] += weight
+                        opp_lane_cid = red_padded[r_idx]
+                        if opp_lane_cid > 0 and int(row.get(f"red_{role}", 0)) == opp_lane_cid:
+                            weight *= 1.5
+                        champ_scores[(cid, role)] += weight * (0.6 * win + 0.4)
+                        champ_weights[(cid, role)] += weight
 
         dominant_archetype = (
             max(archetype_votes, key=archetype_votes.get)
@@ -241,72 +368,153 @@ class DraftRecommendationEngine:
             else self.archetype_mapping.get("0", "Poke")
         )
 
+        ranked_candidates: List[Dict] = []
         if champ_scores:
-            best_cid = max(
-                champ_scores,
-                key=lambda cid: champ_scores[cid] * np.log1p(champ_weights[cid]),
+            sorted_keys = sorted(
+                champ_scores.keys(),
+                key=lambda kr: champ_scores[kr] * np.log1p(champ_weights[kr]),
+                reverse=True,
             )
-            confidence = float(
-                np.clip(champ_scores[best_cid] / max(champ_weights[best_cid], 1e-6), 0.50, 0.95)
-            )
-            champ_name = self.id_to_name.get(best_cid, f"Champion_{best_cid}")
-        else:
+            seen_cids = set()
+            for cid, role in sorted_keys:
+                if cid in seen_cids:
+                    continue
+                seen_cids.add(cid)
+                conf = float(
+                    np.clip(
+                        champ_scores[(cid, role)] / max(champ_weights[(cid, role)], 1e-6),
+                        0.50,
+                        0.95,
+                    )
+                )
+                ranked_candidates.append(
+                    {
+                        "champion": self.id_to_name.get(cid, f"Champion_{cid}"),
+                        "champion_id": cid,
+                        "role": role,
+                        "confidence": round(conf, 3),
+                        "archetype": dominant_archetype,
+                    }
+                )
+                if len(ranked_candidates) >= max(1, top_k):
+                    break
+
+        if not ranked_candidates:
             fallback_id = next((cid for cid in self.id_to_name if cid not in excluded), 1)
             champ_name = self.id_to_name.get(fallback_id, "Jinx")
-            confidence = 0.65
+            ranked_candidates.append(
+                {
+                    "champion": champ_name,
+                    "champion_id": fallback_id,
+                    "role": primary_role,
+                    "confidence": 0.65,
+                    "archetype": dominant_archetype,
+                }
+            )
 
+        best = ranked_candidates[0]
         return {
-            "recommended_champ": champ_name,
-            "confidence": round(confidence, 3),
+            "recommended_champ": best["champion"],
+            "confidence": best["confidence"],
+            "target_role": best["role"],
             "similar_drafts_count": len(similar_drafts),
             "archetype": dominant_archetype,
+            "top_recommendations": ranked_candidates,
         }
 
     def recommend_ban(
-        self, team_champs: List[int], opposing_team_champs: List[int]
+        self,
+        team_champs: List[int] | Dict[str, int],
+        opposing_team_champs: List[int] | Dict[str, int],
+        target_role: Optional[str] = None,
+        top_k: int = 5,
     ) -> Dict:
-        """Recommend a champion ban targeting high-performing enemy picks in similar drafts."""
-        logger.info(f"Generating ban recommendation for team {team_champs}")
-        target_embedding = self.get_draft_embedding(team_champs, opposing_team_champs)
+        """
+        Recommend champion ban(s) targeting high-performing enemy picks in the
+        opposing team's remaining open roles.
+        """
+        blue_padded = self._pad_team(team_champs)
+        red_padded = self._pad_team(opposing_team_champs)
+        enemy_open_roles, primary_enemy_role = self._resolve_candidate_roles(red_padded, target_role)
+
+        logger.info(
+            "Generating ban recommendation against enemy roles %s",
+            enemy_open_roles,
+        )
+        target_embedding = self.get_draft_embedding(blue_padded, red_padded)
         similar_drafts = self.find_similar_drafts(target_embedding, n_similar=50)
 
-        excluded = {int(c) for c in team_champs + opposing_team_champs if int(c) > 0}
-        enemy_threat: Dict[int, float] = defaultdict(float)
-        enemy_weights: Dict[int, float] = defaultdict(float)
+        excluded = {int(c) for c in blue_padded + red_padded if int(c) > 0}
+        enemy_threat: Dict[Tuple[int, str], float] = defaultdict(float)
+        enemy_weights: Dict[Tuple[int, str], float] = defaultdict(float)
 
         for match_id, similarity, idx in similar_drafts:
             red_win = 1.0 - float(self.win_labels[idx])
             row = self.draft_lookup.get(match_id)
             if row:
-                for role in ROLES:
+                for role in enemy_open_roles:
+                    r_idx = ROLES.index(role)
                     cid = int(row.get(f"red_{role}", 0))
                     if cid > 0 and cid not in excluded:
                         weight = max(similarity, 1e-3)
-                        enemy_threat[cid] += weight * (0.65 * red_win + 0.35)
-                        enemy_weights[cid] += weight
+                        our_lane_cid = blue_padded[r_idx]
+                        if our_lane_cid > 0 and int(row.get(f"blue_{role}", 0)) == our_lane_cid:
+                            weight *= 1.5
+                        enemy_threat[(cid, role)] += weight * (0.65 * red_win + 0.35)
+                        enemy_weights[(cid, role)] += weight
 
+        ranked_bans: List[Dict] = []
         if enemy_threat:
-            best_ban_id = max(
-                enemy_threat,
-                key=lambda cid: enemy_threat[cid] * np.log1p(enemy_weights[cid]),
+            sorted_keys = sorted(
+                enemy_threat.keys(),
+                key=lambda kr: enemy_threat[kr] * np.log1p(enemy_weights[kr]),
+                reverse=True,
             )
-            confidence = float(
-                np.clip(
-                    enemy_threat[best_ban_id] / max(enemy_weights[best_ban_id], 1e-6),
-                    0.50,
-                    0.95,
+            seen_cids = set()
+            for cid, role in sorted_keys:
+                if cid in seen_cids:
+                    continue
+                seen_cids.add(cid)
+                conf = float(
+                    np.clip(
+                        enemy_threat[(cid, role)] / max(enemy_weights[(cid, role)], 1e-6),
+                        0.50,
+                        0.95,
+                    )
                 )
-            )
-            ban_name = self.id_to_name.get(best_ban_id, f"Champion_{best_ban_id}")
-        else:
-            fallback_id = next((cid for cid in sorted(self.id_to_name, reverse=True) if cid not in excluded), 2)
-            ban_name = self.id_to_name.get(fallback_id, "Thresh")
-            confidence = 0.65
+                ranked_bans.append(
+                    {
+                        "champion": self.id_to_name.get(cid, f"Champion_{cid}"),
+                        "champion_id": cid,
+                        "role": role,
+                        "confidence": round(conf, 3),
+                    }
+                )
+                if len(ranked_bans) >= max(1, top_k):
+                    break
 
+        if not ranked_bans:
+            fallback_id = next(
+                (cid for cid in sorted(self.id_to_name, reverse=True) if cid not in excluded),
+                2,
+            )
+            ban_name = self.id_to_name.get(fallback_id, "Thresh")
+            ranked_bans.append(
+                {
+                    "champion": ban_name,
+                    "champion_id": fallback_id,
+                    "role": primary_enemy_role,
+                    "confidence": 0.65,
+                }
+            )
+
+        best_ban = ranked_bans[0]
         return {
-            "recommended_ban": ban_name,
-            "confidence": round(confidence, 3),
+            "recommended_ban": best_ban["champion"],
+            "confidence": best_ban["confidence"],
+            "target_role": best_ban["role"],
             "reason": "Highest similarity-weighted opposing win rate in comparable drafts",
+            "top_bans": ranked_bans,
         }
 
     def evaluate_recommendation_quality(self, test_data: List[Dict]) -> Dict:
@@ -317,9 +525,10 @@ class DraftRecommendationEngine:
         recommended = []
         hits = 0
         for sample in test_data:
-            blue = sample.get("blue", [1, 2, 3, 4])
+            blue = sample.get("blue", [1, 2, 3, 4, 0])
             red = sample.get("red", [6, 7, 8, 9, 10])
-            rec = self.recommend_pick(blue, red)
+            target_role = sample.get("target_role")
+            rec = self.recommend_pick(blue, red, target_role=target_role)
             recommended.append(rec["recommended_champ"])
             if rec["confidence"] >= 0.5:
                 hits += 1
@@ -343,19 +552,19 @@ def main():
         data_dir="./data/processed",
     )
 
-    blue_team = [1, 2, 3, 4, 5]
-    red_team = [6, 7, 8, 9, 10]
+    blue_team = [1, 2, 3, 4, 0]
+    red_team = [6, 7, 8, 9, 0]
 
-    pick_rec = engine.recommend_pick(blue_team, red_team)
-    ban_rec = engine.recommend_ban(blue_team, red_team)
+    pick_rec = engine.recommend_pick(blue_team, red_team, target_role="sup")
+    ban_rec = engine.recommend_ban(blue_team, red_team, target_role="sup")
 
     print("Recommendation Results:")
     print(
-        f"Recommended Pick: {pick_rec['recommended_champ']} "
+        f"Recommended Pick ({pick_rec['target_role'].upper()}): {pick_rec['recommended_champ']} "
         f"(Confidence: {pick_rec['confidence']}, Archetype: {pick_rec['archetype']})"
     )
     print(
-        f"Recommended Ban: {ban_rec['recommended_ban']} "
+        f"Recommended Ban ({ban_rec['target_role'].upper()}): {ban_rec['recommended_ban']} "
         f"(Confidence: {ban_rec['confidence']} — {ban_rec['reason']})"
     )
 

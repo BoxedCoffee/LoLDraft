@@ -132,9 +132,18 @@ git lfs install
 git lfs pull
 ```
 
-There is no dedicated test suite or configured linter. Validate Python changes
-with:
+## Automated Testing & Validation
+
+Run the automated test suite from the repository root:
 
 ```powershell
-python -m py_compile path\to\changed_file.py
+python tests\test_loldraft_suite.py
+# or with pytest:
+pytest -v tests\test_loldraft_suite.py
 ```
+
+The suite covers `DraftModel` (`MatchupSynergyBlock` and legacy checkpoint
+compatibility), profile-based archetype clustering (`clustering.py`),
+role-aware KNN pick/ban recommendations (`recommendation_engine.py`),
+`draft_analyzer` deduplication and the Pick & Ban Advisor (`analysis.py`),
+and Phase 2a Voronoi macro trajectory probes (`macro_trajectory.py`).
