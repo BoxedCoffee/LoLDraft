@@ -91,7 +91,15 @@ st.set_page_config(
 st.markdown(
     """
     <style>
-    .block-container {max-width: 1540px; padding-top: 1.1rem; padding-bottom: 2.5rem;}
+    .block-container {
+        width: 100%; max-width: 1540px; margin: 0 auto; box-sizing: border-box;
+        padding: 1rem clamp(.75rem, 3vw, 2rem) 2.5rem;
+    }
+    [data-testid="stAppViewContainer"], [data-testid="stMain"] {overflow-x: hidden;}
+    [data-testid="stHorizontalBlock"] {min-width: 0 !important; align-items: flex-start; gap: .75rem;}
+    [data-testid="column"] {min-width: 0 !important; width: 0 !important; flex-shrink: 1 !important;}
+    [data-testid="column"] > div {min-width: 0 !important;}
+    [data-testid="stVerticalBlock"] {min-width: 0 !important;}
     .hero {
         padding: 1rem 1.4rem; border-radius: 14px; margin-bottom: .75rem;
         background: radial-gradient(circle at 15% 20%, #1a2c54 0%, #0d1527 60%, #1a1429 100%);
@@ -101,10 +109,14 @@ st.markdown(
     .hero h1 {color: #f8fafc; margin: 0; font-size: 1.65rem; font-weight: 800; letter-spacing: -0.02em;}
     .hero p {color: #b4c6e7; margin: .2rem 0 0; font-size: .88rem;}
     .kicker {text-transform: uppercase; letter-spacing: .14em; color: #c8aa6e; font-size: .68rem; font-weight: 700;}
+    .section-label {
+        color: #94a3b8; font-size: .72rem; font-weight: 800; letter-spacing: .1em;
+        text-transform: uppercase; margin: .6rem 0 .45rem;
+    }
 
     /* Interactive Role Slot Cards */
     .slot-card {
-        position: relative; overflow: hidden; border-radius: 11px; height: 68px;
+        position: relative; overflow: hidden; border-radius: 12px; min-height: 68px;
         margin-bottom: .2rem; border: 1.5px solid #283650; background: #0f172a;
         display: flex; align-items: center; padding: 0 .65rem; gap: .65rem;
         box-shadow: 0 4px 10px rgba(0,0,0,0.25); transition: all 0.15s ease;
@@ -185,6 +197,10 @@ st.markdown(
         white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
     }
     .champ-tile-meta {font-size: .65rem; color: #94a3b8;}
+    .slot-clear {
+        color: #94a3b8; font-size: .68rem; text-align: center; margin: .15rem 0 .65rem;
+    }
+    .slot-clear:hover {color: #fda4af;}
 
     /* Win Probability Tug-of-War Bar */
     .tug-wrap {
@@ -197,6 +213,29 @@ st.markdown(
         background: #f43f5e; display: flex; border: 1px solid #334155;
     }
     .tug-blue {background: linear-gradient(90deg, #2563eb, #60a5fa); height: 100%; transition: width 0.3s ease;}
+    @media (max-width: 900px) {
+        .block-container {padding-left: .65rem; padding-right: .65rem;}
+        .hero {padding: .85rem 1rem;}
+        .hero h1 {font-size: 1.3rem;}
+        .picker-banner {align-items: flex-start; flex-direction: column; gap: .25rem;}
+        .tug-labels {font-size: .72rem; flex-wrap: wrap; gap: .35rem .75rem;}
+        [data-testid="element-container"]:has(.draft-board-marker) + [data-testid="stHorizontalBlock"] {
+            flex-wrap: wrap !important;
+        }
+        [data-testid="element-container"]:has(.draft-board-marker) + [data-testid="stHorizontalBlock"] > [data-testid="column"] {
+            flex: 1 1 100% !important; width: 100% !important; max-width: 100% !important;
+        }
+    }
+    @media (max-width: 620px) {
+        [data-testid="stHorizontalBlock"] {gap: .45rem;}
+        .slot-card {min-height: 62px; padding: 0 .45rem; gap: .45rem;}
+        .slot-avatar {width: 42px; height: 42px;}
+        .slot-champ {font-size: .84rem;}
+        .slot-sub {font-size: .6rem;}
+        .champ-tile img {width: 46px; height: 46px;}
+        .champ-tile-name {font-size: .65rem;}
+        .champ-tile-meta {font-size: .58rem;}
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -686,7 +725,7 @@ def render_slot_card_html(
         f'<div class="slot-info">'
         f'<div class="slot-role">{role_label} {active_badge}</div>'
         f'<div class="slot-champ empty">Open Slot</div>'
-        f'<div class="slot-sub">Click button below to target this slot</div>'
+        f'<div class="slot-sub">Click this card to target the slot</div>'
         f'</div></div>'
     )
 
@@ -713,34 +752,11 @@ def render_interactive_team_column(
             unsafe_allow_html=True,
         )
         if champ:
-            b1, b2 = st.columns([4, 1])
-            with b1:
-                btn_label = f"🎯 Editing {ROLE_LABELS[role]}" if is_active else f"✏️ Change {ROLE_LABELS[role]} ({champ})"
-                st.button(
-                    btn_label,
-                    key=f"target_{side}_{role}",
-                    type="primary" if is_active else "secondary",
-                    use_container_width=True,
-                    on_click=cb_target_slot,
-                    args=(side, role),
-                )
-            with b2:
-                st.button(
-                    "✖",
-                    key=f"clear_{side}_{role}",
-                    help=f"Clear {side.title()} {ROLE_LABELS[role]}",
-                    use_container_width=True,
-                    on_click=cb_clear_slot,
-                    args=(side, role),
-                )
-        else:
-            btn_label = f"🎯 Picking {side.title()} {ROLE_LABELS[role]}..." if is_active else f"➕ Pick {side.title()} {ROLE_LABELS[role]}"
             st.button(
-                btn_label,
-                key=f"target_{side}_{role}",
-                type="primary" if is_active else "secondary",
-                use_container_width=True,
-                on_click=cb_target_slot,
+                "Clear slot",
+                key=f"clear_{side}_{role}",
+                help=f"Clear {side.title()} {ROLE_LABELS[role]}",
+                on_click=cb_clear_slot,
                 args=(side, role),
             )
 
@@ -770,7 +786,7 @@ def main() -> None:
         '<div class="hero">'
         '<div><div class="kicker">Riot Data Dragon · 751,339 Matches · Wide & Deep Neural Encoder</div>'
         '<h1>⚔️ LoL Champion Select Studio & Draft Pathways</h1>'
-        '<p>Click any Blue or Red role slot below, then click a champion portrait in the center grid (or load a 1-click preset).</p></div>'
+        '<p>Click a role card to target it, then click any champion portrait to lock it in. Search and filters are available when you need them.</p></div>'
         '</div>',
         unsafe_allow_html=True,
     )
@@ -880,6 +896,7 @@ def main() -> None:
         ) = st.session_state["_analysis_cache"]
 
     # ── 3-Column League Client Champion Select Board ──
+    st.markdown('<span class="draft-board-marker" aria-hidden="true"></span>', unsafe_allow_html=True)
     col_blue, col_center, col_red = st.columns([1.05, 1.9, 1.05], gap="medium")
 
     with col_blue:
