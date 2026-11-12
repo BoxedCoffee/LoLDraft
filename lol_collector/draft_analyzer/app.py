@@ -1178,6 +1178,14 @@ function clearSlot(ev, side, role) {{
 
 function pickChampion(champName) {{
   const {{ side, role }} = activeSlot;
+  if (!champName || !BOOT.champMeta[champName]) return;
+  const pickedElsewhere = new Set([
+    ...Object.values(draftState.blue),
+    ...Object.values(draftState.red),
+  ]);
+  if (pickedElsewhere.has(champName) && draftState[side][role] !== champName) {{
+    return;
+  }}
   draftState[side][role] = champName;
 
   // Auto-advance cursor to next open slot
@@ -1377,9 +1385,9 @@ function renderChampGrid() {{
     const rStat = roleMap[c];
     const subTxt = rStat ? `${{(rStat.win_rate * 100).toFixed(1)}}%` : (meta.arch_list[0] || "Flex");
     const isPicked = pickedSet.has(c) && c !== curSlotChamp;
-    const safeName = c.replace(/'/g, "\\'");
+    const clickArg = JSON.stringify(c);
     html += `
-      <div class="champ-cell ${{isPicked ? 'picked' : ''}}" onclick="pickChampion('${{safeName}}')" title="${{c}} (${{meta.archetypes}})">
+      <div class="champ-cell ${{isPicked ? 'picked' : ''}}" onclick='pickChampion(${{clickArg}})' title="${{c}} (${{meta.archetypes}})">
         <img src="${{meta.image}}" loading="lazy" alt="${{c}}">
         <div class="champ-cell-name">${{c}}</div>
         <div class="champ-cell-wr">${{subTxt}}</div>
@@ -1408,9 +1416,9 @@ function renderAnalysis(data) {{
   const recBox = document.getElementById("rec-chips");
   const topRecs = (data.recommendations || []).slice(0, 4);
   recBox.innerHTML = topRecs.map(r => {{
-    const safe = r.champion.replace(/'/g, "\\'");
+    const clickArg = JSON.stringify(r.champion);
     const laneTxt = r.lane_wr !== null ? `Lane ${{r.lane_wr}}%` : `WR ${{r.role_wr}}%`;
-    return `<div class="adv-chip" onclick="pickChampion('${{safe}}')" title="Click to lock in ${{r.champion}}">
+    return `<div class="adv-chip" onclick='pickChampion(${{clickArg}})' title="Click to lock in ${{r.champion}}">
       <img src="${{champImg(r.champion)}}" alt="">
       <div class="adv-chip-info">
         <div class="adv-chip-name">${{r.champion}}</div>
@@ -1583,8 +1591,8 @@ function renderMatchupsAndAdvisorTables(data) {{
       <thead><tr><th>Champion</th><th>Archetype</th><th>Score</th><th>Role WR</th><th>Lane vs Opp</th><th>Gold @10m</th></tr></thead>
       <tbody>
         ${{recs.map(r => {{
-          const safe = r.champion.replace(/'/g, "\\'");
-          return `<tr style="cursor:pointer;" onclick="pickChampion('${{safe}}')">
+          const clickArg = JSON.stringify(r.champion);
+          return `<tr style="cursor:pointer;" onclick='pickChampion(${{clickArg}})'>
             <td><div class="td-champ"><img src="${{champImg(r.champion)}}">${{r.champion}}</div></td>
             <td><span class="arch-tag">${{r.archetypes}}</span></td>
             <td><b style="color:var(--gold-bright);">${{r.score}}</b></td>
