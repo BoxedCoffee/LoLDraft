@@ -290,7 +290,7 @@ def predict(model, patch_vocab, name_to_model_id, blue_team, red_team):
         "embedding": embedding[0].cpu(),
         "win_probability": win_probability,
         "gold_curve": np.nan_to_num(
-            gold_pred[0].cpu().numpy(), nan=0.0, posinf=0.0, neginf=0.0
+            gold_pred[0].cpu().numpy() * 5000.0, nan=0.0, posinf=0.0, neginf=0.0
         ),
         "objective_predictions": objective_predictions,
         "objective_probabilities": objective_probabilities,
