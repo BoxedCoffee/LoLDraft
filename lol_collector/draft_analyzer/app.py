@@ -2,16 +2,20 @@
 """
 LoL Draft Studio — Zero-Refresh Client-Side SPA + Vectorized int16 Analytics & Neural Engine.
 
-Works seamlessly both via:
-  1. `streamlit run lol_collector/draft_analyzer/app.py`
-  2. `python lol_collector/draft_analyzer/app.py` (standalone server at http://127.0.0.1:8765)
-
-Why this eliminates page refreshes & UI lag:
-  - All slot selection, champion picking, search, role/archetype filtering, preset loading,
-    and tab switching run 100% client-side in the browser DOM (0 ms, zero Streamlit rerun).
-  - Live analytics & neural predictions are served over a persistent in-memory localhost JSON
-    endpoint (`/api/analyze`) backed by a vectorized `np.int16` draft matrix (751,339 matches
-    queried in ~10 ms) and the trained Wide & Deep `DraftModel` (`checkpoints/best.pt`).
+Fixes & Capabilities:
+  1. Apostrophe-safe integer index click handlers (`pickChampByIdx(idx)`): champions like
+     K'Sante, Kai'Sa, Cho'Gath, Kha'Zix, Rek'Sai, Vel'Koz, Bel'Veth, Kog'Maw, and
+     Nunu & Willump never break HTML onclick attributes.
+  2. Complete 172-champion icon & splash coverage: upgrades Data Dragon to 14.24.1, maps
+     post-14.20 champions (Ambessa, Mel, Yunara, Zaahen) to CommunityDragon Riot-ID icons,
+     fixes Fiddlesticks splash casing (`FiddleSticks_0.jpg`), and includes a 3-tier
+     `onerror` fallback ending in a styled SVG monogram badge.
+  3. Instant 0ms Dynamic AI Pick & Ban Recommendations: precomputes the 751,339-match
+     5-role head-to-head lane matrices (games, wins, 10m gold diff), 172x172 pairwise
+     same-team synergy matrix, and 172x172 cross-team counter matrix at startup (~400 ms)
+     and ships them to the browser so every single pick/clear/slot change immediately
+     re-ranks AI Picks and Priority Enemy Bans in 0 ms, while `/api/analyze` streams in
+     live Wide & Deep PyTorch `DraftModel` multi-task predictions.
 """
 
 from __future__ import annotations
@@ -55,7 +59,11 @@ DATA_DIR = ENCODER_DIR / "data" / "processed_riot"
 OUTPUT_DIR = APP_DIR / "analysis_output"
 CHECKPOINT_PATH = ENCODER_DIR / "checkpoints" / "best.pt"
 OBJECTIVE_LABELS = {"dragon": "Dragon", "herald": "Herald", "baron": "Baron", "tower": "Tower"}
-DDRAGON_VERSION = "14.20.1"
+
+# Use 14.24.1 (includes Ambessa) + CommunityDragon Riot-ID fallback for 2025 champions (Mel, Yunara, Zaahen)
+DDRAGON_VERSION = "14.24.1"
+POST_14_24_CHAMPS = {"Mel", "Yunara", "Zaahen"}
+SPLASH_ID_OVERRIDES = {"Fiddlesticks": "FiddleSticks"}
 
 ROLE_ICONS = {
     "top": "https://raw.communitydragon.org/latest/plugins/rcp-fe-lol-clash/global/default/assets/images/position-selector/positions/icon-position-top.png",
@@ -86,7 +94,7 @@ DEMO_PRESETS: dict[str, dict[str, dict[str, str]]] = {
 
 
 def build_champion_metadata(encoder_data_dir: Path) -> tuple[dict[str, str], dict[str, dict]]:
-    """Resolve vocabulary IDs, Riot IDs, and Data Dragon metadata (square icon, splash art, title)."""
+    """Resolve vocabulary IDs, Riot IDs, and resilient Data Dragon + CommunityDragon URLs."""
     id_to_name: dict[str, str] = {}
     riot_id_to_name: dict[str, str] = {}
     champ_meta: dict[str, dict] = {}
@@ -103,24 +111,33 @@ def build_champion_metadata(encoder_data_dir: Path) -> tuple[dict[str, str], dic
             name = entry.get("name")
             if not name:
                 continue
+            riot_id = entry.get("riot_id") or key
             ddragon_id = entry.get("ddragon_id") or name.replace(" ", "").replace("'", "").replace(".", "")
-            square_url = entry.get("image") or f"https://ddragon.leagueoflegends.com/cdn/{DDRAGON_VERSION}/img/champion/{ddragon_id}.png"
-            splash_url = f"https://ddragon.leagueoflegends.com/cdn/img/champion/splash/{ddragon_id}_0.jpg"
+            cdrag_icon = f"https://raw.communitydragon.org/latest/plugins/rcp-be-lol-game-data/global/default/v1/champion-icons/{riot_id}.png"
+
+            if name in POST_14_24_CHAMPS:
+                square_url = cdrag_icon
+                splash_url = f"https://raw.communitydragon.org/latest/plugins/rcp-be-lol-game-data/global/default/assets/characters/{ddragon_id.lower()}/skins/base/images/{ddragon_id.lower()}_splash_tile_0.jpg"
+            else:
+                square_url = f"https://ddragon.leagueoflegends.com/cdn/{DDRAGON_VERSION}/img/champion/{ddragon_id}.png"
+                splash_dd = SPLASH_ID_OVERRIDES.get(name, ddragon_id)
+                splash_url = f"https://ddragon.leagueoflegends.com/cdn/img/champion/splash/{splash_dd}_0.jpg"
+
             arch_str = champion_archetype_tags(name)
             champ_meta[name] = {
                 "name": name,
                 "title": entry.get("title", ""),
-                "riot_id": entry.get("riot_id"),
+                "riot_id": int(riot_id) if str(riot_id).isdigit() else 0,
                 "ddragon_id": ddragon_id,
                 "image": square_url,
+                "cdrag_image": cdrag_icon,
                 "splash": splash_url,
                 "archetypes": arch_str,
                 "arch_list": [t.strip() for t in arch_str.split(",") if t.strip()],
             }
             id_to_name[str(key)] = name
             if entry.get("riot_id") is not None:
-                riot_to_name_key = str(entry["riot_id"])
-                riot_id_to_name[riot_to_name_key] = name
+                riot_id_to_name[str(entry["riot_id"])] = name
 
     vocab_path = encoder_data_dir / "processed_riot" / "champion_vocab.json"
     if vocab_path.exists():
@@ -146,9 +163,8 @@ def wilson_ci(wins: float, n: int) -> tuple[float, float]:
 
 class FastDraftEngine:
     """
-    In-memory vectorized int16 analytics + Wide & Deep PyTorch neural inference engine.
-    Queries 751,339 historical matches in ~10 ms using integer array comparisons instead
-    of Pandas string scans.
+    In-memory vectorized int16 analytics + precomputed 172x172 synergy/counter/lane
+    matrices + Wide & Deep PyTorch neural inference engine.
     """
 
     def __init__(self):
@@ -167,16 +183,32 @@ class FastDraftEngine:
         self.stats_df = stats
         self.total_matches = len(table)
 
-        # Build compact champion <-> int16 index for instant numpy comparisons
         all_names = sorted(
             set(self.champ_meta.keys()) | set(stats["champion"].dropna().astype(str).unique()),
             key=str.casefold,
         )
+        # Ensure every champion in all_names has a champ_meta entry
+        for name in all_names:
+            if name not in self.champ_meta:
+                dd = name.replace(" ", "").replace("'", "").replace(".", "")
+                arch_str = champion_archetype_tags(name)
+                self.champ_meta[name] = {
+                    "name": name,
+                    "title": "",
+                    "riot_id": 0,
+                    "ddragon_id": dd,
+                    "image": f"https://ddragon.leagueoflegends.com/cdn/{DDRAGON_VERSION}/img/champion/{dd}.png",
+                    "cdrag_image": "https://raw.communitydragon.org/latest/plugins/rcp-be-lol-game-data/global/default/v1/champion-icons/-1.png",
+                    "splash": f"https://ddragon.leagueoflegends.com/cdn/img/champion/splash/{dd}_0.jpg",
+                    "archetypes": arch_str,
+                    "arch_list": [t.strip() for t in arch_str.split(",") if t.strip()],
+                }
+
         self.all_champions = all_names
+        # 1-based index for draft_mat (0 = empty/unselected)
         self.name_to_idx: dict[str, int] = {name: i + 1 for i, name in enumerate(all_names)}
         self.idx_to_name: dict[int, str] = {i + 1: name for i, name in enumerate(all_names)}
 
-        # Encode (N, 10) int16 draft matrix: cols 0..4 = blue_top..sup, cols 5..9 = red_top..sup
         n_rows = len(table)
         self.draft_mat = np.zeros((n_rows, 10), dtype=np.int16)
         for r_idx, role in enumerate(ROLES):
@@ -187,11 +219,8 @@ class FastDraftEngine:
                 table[f"red_{role}"].map(self.name_to_idx).fillna(0).to_numpy(dtype=np.int16)
             )
 
-        # Pre-extract contiguous metric arrays for sub-10ms aggregation
         self.patches = table["patch"].fillna("").astype(str).to_numpy()
-        self.unique_patches = sorted(
-            [p for p in pd.unique(self.patches) if p], reverse=True
-        )
+        self.unique_patches = sorted([p for p in pd.unique(self.patches) if p], reverse=True)
         self.blue_win = table["blue_win"].to_numpy(dtype=np.bool_)
         self.blue_ahead_10 = table["blue_ahead_10"].to_numpy(dtype=np.bool_)
 
@@ -213,7 +242,6 @@ class FastDraftEngine:
                 else np.zeros(n_rows, dtype=np.int16)
             )
 
-        # Pre-build archetype membership boolean lookup per champion index (num_champs+1, 4)
         self.arch_labels = list(ARCHETYPE_RULES.keys())
         self.champ_arch_mask = np.zeros((len(all_names) + 1, len(self.arch_labels)), dtype=np.int8)
         for c_name, c_idx in self.name_to_idx.items():
@@ -222,25 +250,105 @@ class FastDraftEngine:
                 if folded in ARCHETYPE_RULES[a_label]:
                     self.champ_arch_mask[c_idx, a_idx] = 1
 
-        # Pre-build role stats dictionary for instant client & server lookup
         self.role_stats_map: dict[str, list[dict[str, Any]]] = {r: [] for r in ROLES}
-        self.champ_role_lookup: dict[tuple[str, str], dict[str, Any]] = {}
         for row in stats.itertuples(index=False):
             r = str(row.role)
             c = str(row.champion)
-            entry = {
-                "champion": c,
-                "role": r,
-                "matches": int(row.matches),
-                "win_rate": round(float(row.win_rate), 4),
-                "mean_gold_diff_10": round(float(row.mean_gold_diff_10), 1),
-            }
-            if r in self.role_stats_map:
-                self.role_stats_map[r].append(entry)
-            self.champ_role_lookup[(c, r)] = entry
+            if r in self.role_stats_map and c in self.name_to_idx:
+                self.role_stats_map[r].append({
+                    "champion": c,
+                    "cid": self.name_to_idx[c],
+                    "role": r,
+                    "matches": int(row.matches),
+                    "win_rate": round(float(row.win_rate), 4),
+                    "mean_gold_diff_10": round(float(row.mean_gold_diff_10), 1),
+                })
+
+        # Precompute global pairwise Synergy, Counter, and per-Role Lane Matchup matrices (~400ms)
+        self._precompute_interaction_matrices()
 
         # Load Neural DraftModel if available
         self.predictor = self._load_neural_model()
+
+    def _precompute_interaction_matrices(self) -> None:
+        """
+        Precompute across all 751,339 matches:
+          - syn_games[c1, c2], syn_wins[c1, c2]: same-team pairwise synergy
+          - cnt_games[c1, c2], cnt_wins[c1, c2]: cross-team counter performance (c1 vs enemy c2)
+          - lane_games[r, c1, c2], lane_wins[r, c1, c2], lane_gold[r, c1, c2]: head-to-head lane stats
+        """
+        C = len(self.all_champions) + 1
+        bw_float = self.blue_win.astype(np.float64)
+        rw_float = 1.0 - bw_float
+        g10_float = self.gold_Arrays[10].astype(np.float64)
+
+        self.lane_games = np.zeros((5, C, C), dtype=np.int32)
+        self.lane_wins = np.zeros((5, C, C), dtype=np.float64)
+        self.lane_gold = np.zeros((5, C, C), dtype=np.float64)
+
+        for r in range(5):
+            bc = self.draft_mat[:, r].astype(np.int32)
+            rc = self.draft_mat[:, r + 5].astype(np.int32)
+            flat_br = bc * C + rc
+            g_br = np.bincount(flat_br, minlength=C * C).reshape(C, C)
+            w_br = np.bincount(flat_br, weights=bw_float, minlength=C * C).reshape(C, C)
+            gold_br = np.bincount(flat_br, weights=g10_float, minlength=C * C).reshape(C, C)
+
+            self.lane_games[r] = g_br + g_br.T
+            self.lane_wins[r] = w_br + (g_br.T - w_br.T)
+            self.lane_gold[r] = gold_br - gold_br.T
+
+        self.syn_games = np.zeros((C, C), dtype=np.int32)
+        self.syn_wins = np.zeros((C, C), dtype=np.float64)
+        for i in range(5):
+            for j in range(i + 1, 5):
+                bi, bj = self.draft_mat[:, i].astype(np.int32), self.draft_mat[:, j].astype(np.int32)
+                fb = bi * C + bj
+                gb = np.bincount(fb, minlength=C * C).reshape(C, C)
+                wb = np.bincount(fb, weights=bw_float, minlength=C * C).reshape(C, C)
+
+                ri, rj = self.draft_mat[:, i + 5].astype(np.int32), self.draft_mat[:, j + 5].astype(np.int32)
+                fr = ri * C + rj
+                gr = np.bincount(fr, minlength=C * C).reshape(C, C)
+                wr = np.bincount(fr, weights=rw_float, minlength=C * C).reshape(C, C)
+
+                self.syn_games += gb + gb.T + gr + gr.T
+                self.syn_wins += wb + wb.T + wr + wr.T
+
+        self.cnt_games = np.zeros((C, C), dtype=np.int32)
+        self.cnt_wins = np.zeros((C, C), dtype=np.float64)
+        for i in range(5):
+            bi = self.draft_mat[:, i].astype(np.int32)
+            for j in range(5):
+                rj = self.draft_mat[:, j + 5].astype(np.int32)
+                fc = bi * C + rj
+                gc = np.bincount(fc, minlength=C * C).reshape(C, C)
+                wc = np.bincount(fc, weights=bw_float, minlength=C * C).reshape(C, C)
+                self.cnt_games += gc + gc.T
+                self.cnt_wins += wc + (gc.T - wc.T)
+
+        # Build compact JSON-ready lookup tables for instant 0ms client-side reactivity
+        # Smoothed pairwise synergy win rate: (wins + 25 * 0.5) / (games + 25)
+        syn_wr_mat = np.round((self.syn_wins + 12.5) / (self.syn_games + 25.0), 4)
+        cnt_wr_mat = np.round((self.cnt_wins + 12.5) / (self.cnt_games + 25.0), 4)
+        self.syn_wr_list = syn_wr_mat.tolist()
+        self.cnt_wr_list = cnt_wr_mat.tolist()
+
+        # Sparse per-role lane matchup lookup: role -> { "c1_c2": [games, wr, gold10] }
+        self.sparse_lane_map: dict[str, dict[str, list[float]]] = {r: {} for r in ROLES}
+        for r_idx, r_name in enumerate(ROLES):
+            nz_i, nz_j = np.nonzero(self.lane_games[r_idx] >= 3)
+            for i_val, j_val in zip(nz_i, nz_j):
+                if i_val == 0 or j_val == 0 or i_val == j_val:
+                    continue
+                g_cnt = int(self.lane_games[r_idx, i_val, j_val])
+                w_cnt = float(self.lane_wins[r_idx, i_val, j_val])
+                g10_sum = float(self.lane_gold[r_idx, i_val, j_val])
+                self.sparse_lane_map[r_name][f"{i_val}_{j_val}"] = [
+                    g_cnt,
+                    round(w_cnt / g_cnt, 4),
+                    round(g10_sum / g_cnt, 1),
+                ]
 
     def _load_neural_model(self) -> dict[str, Any] | None:
         if not HAS_TORCH or not CHECKPOINT_PATH.exists():
@@ -339,7 +447,7 @@ class FastDraftEngine:
         n_scoped = len(scoped_indices)
         sub_mat = self.draft_mat[scoped_indices]
 
-        selected: list[tuple[int, int, int]] = []  # (col_idx 0..9, role_idx 0..4, champ_idx)
+        selected: list[tuple[int, int, int]] = []
         for r_idx, r in enumerate(ROLES):
             b_c = self.name_to_idx.get(blue.get(r, ""), 0)
             if b_c > 0:
@@ -382,7 +490,6 @@ class FastDraftEngine:
             elif mode == "Champion presence":
                 sim_local_idx = np.flatnonzero(pres_hits == n_sel)
             else:
-                # Auto relaxation using precomputed hit vectors (0.1 ms!)
                 for req in range(n_sel, 0, -1):
                     for m_name, vec in (
                         ("Exact roles & sides", exact_hits),
@@ -427,7 +534,6 @@ class FastDraftEngine:
                 b_first = float((t_arr[valid] == 100).mean()) if n_val > 0 else 0.0
                 r_first = float((t_arr[valid] == 200).mean()) if n_val > 0 else 0.0
 
-                # Conditional win rates when securing objective
                 b_sec = t_arr == 100
                 win_if_first = float(sim_wins[b_sec].mean()) if np.any(b_sec) else 0.0
                 ahead_sec = b_sec & ahead_mask
@@ -442,12 +548,10 @@ class FastDraftEngine:
                     "blue_win_behind_first": round(float(sim_wins[behind_sec].mean()), 4) if np.any(behind_sec) else None,
                 }
 
-            # Fast vectorized archetype distribution on similar matches
             sample_idx = sim_global_idx[:5000]
             arch_dist = {}
             for s_idx, s_name in ((0, "blue"), (5, "red")):
-                team_ids = self.draft_mat[sample_idx, s_idx : s_idx + 5]  # (M, 5)
-                # Sum archetype tags across the 5 champions per match: (M, 4)
+                team_ids = self.draft_mat[sample_idx, s_idx : s_idx + 5]
                 tag_sums = self.champ_arch_mask[team_ids].sum(axis=1)
                 top_a = np.argmax(tag_sums, axis=1)
                 max_tags = np.max(tag_sums, axis=1)
@@ -467,52 +571,29 @@ class FastDraftEngine:
             objectives_out = {}
             arch_dist = {"blue": {}, "red": {}}
 
-        # Head-to-head lane matchups across scoped dataset
         lane_matchups = []
         for r_idx, r in enumerate(ROLES):
             b_name = blue.get(r, "")
             r_name = red.get(r, "")
             if b_name and r_name:
-                b_cid = self.name_to_idx.get(b_name, -1)
-                r_cid = self.name_to_idx.get(r_name, -1)
-                m_mask = (sub_mat[:, r_idx] == b_cid) & (sub_mat[:, r_idx + 5] == r_cid)
-                m_global = scoped_indices[m_mask]
-                m_cnt = len(m_global)
-                lane_matchups.append({
-                    "role": r,
-                    "role_label": ROLE_LABELS[r],
-                    "blue_champ": b_name,
-                    "red_champ": r_name,
-                    "matches": m_cnt,
-                    "blue_wr": round(float(self.blue_win[m_global].mean()), 4) if m_cnt > 0 else None,
-                    "gold_10": round(float(self.gold_Arrays[10][m_global].mean()), 1) if m_cnt > 0 else None,
-                })
+                b_cid = self.name_to_idx.get(b_name, 0)
+                r_cid = self.name_to_idx.get(r_name, 0)
+                if b_cid > 0 and r_cid > 0:
+                    m_cnt = int(self.lane_games[r_idx, b_cid, r_cid])
+                    b_wr = float(self.lane_wins[r_idx, b_cid, r_cid] / m_cnt) if m_cnt > 0 else None
+                    g_10 = float(self.lane_gold[r_idx, b_cid, r_cid] / m_cnt) if m_cnt > 0 else None
+                    lane_matchups.append({
+                        "role": r,
+                        "role_label": ROLE_LABELS[r],
+                        "blue_champ": b_name,
+                        "red_champ": r_name,
+                        "matches": m_cnt,
+                        "blue_wr": round(b_wr, 4) if b_wr is not None else None,
+                        "gold_10": round(g_10, 1) if g_10 is not None else None,
+                    })
 
-        # Vectorized Pick & Ban Recommendations for active_side & active_role
-        recs = self._recommend_for_slot(
-            scoped_indices, sim_global_idx, blue, red, active_side, active_role, baseline_wr, top_k=10
-        )
-
-        # Priority Bans targeting remaining open enemy roles
-        enemy_side = "red" if active_side == "blue" else "blue"
-        enemy_picks = red if active_side == "blue" else blue
-        open_enemy_roles = [r for r in ROLES if not enemy_picks.get(r)] or list(ROLES)
-        ban_pool = []
-        for er in open_enemy_roles:
-            er_recs = self._recommend_for_slot(
-                scoped_indices, sim_global_idx, blue, red, enemy_side, er, baseline_wr, top_k=4
-            )
-            ban_pool.extend(er_recs)
-        ban_pool.sort(key=lambda x: (x["score"], x["role_matches"]), reverse=True)
-        seen_bans = set()
-        top_bans = []
-        for item in ban_pool:
-            if item["champion"] not in seen_bans:
-                seen_bans.add(item["champion"])
-                top_bans.append(item)
-                if len(top_bans) >= 6:
-                    break
-
+        recs = self._recommend_for_slot_dynamic(blue, red, active_side, active_role, top_k=10)
+        bans = self._recommend_bans_dynamic(blue, red, active_side, top_k=6)
         neural = self.run_neural(blue, red, patch)
 
         return {
@@ -530,99 +611,146 @@ class FastDraftEngine:
             "arch_dist": arch_dist,
             "lane_matchups": lane_matchups,
             "recommendations": recs,
-            "bans": top_bans,
+            "bans": bans,
             "ladder": ladder,
             "neural": neural,
         }
 
-    def _recommend_for_slot(
+    def _recommend_for_slot_dynamic(
         self,
-        scoped_indices: np.ndarray,
-        sim_global_idx: np.ndarray,
         blue: dict[str, str],
         red: dict[str, str],
         target_side: str,
         target_role: str,
-        baseline_blue_wr: float,
-        top_k: int = 8,
+        top_k: int = 10,
     ) -> list[dict[str, Any]]:
+        """
+        Dynamic context-sensitive recommender combining:
+          1) Pairwise Synergy with all locked allies on `target_side`
+          2) Counter Win Rate against all locked enemies on the opposing side
+          3) Direct Head-to-Head Lane Matchup vs the opposing laner in `target_role`
+          4) Smoothed Role Base Win Rate
+        """
         side = target_side.lower()
         r_idx = ROLES.index(target_role)
-        own_col = r_idx if side == "blue" else r_idx + 5
-        opp_col = r_idx + 5 if side == "blue" else r_idx
+        own_picks = blue if side == "blue" else red
         opp_picks = red if side == "blue" else blue
+
+        ally_cids = [
+            self.name_to_idx[c]
+            for r, c in own_picks.items()
+            if r != target_role and c and c in self.name_to_idx
+        ]
+        enemy_cids = [
+            self.name_to_idx[c]
+            for r, c in opp_picks.items()
+            if c and c in self.name_to_idx
+        ]
         opp_laner = opp_picks.get(target_role, "")
-        opp_cid = self.name_to_idx.get(opp_laner, 0)
-
+        opp_lane_cid = self.name_to_idx.get(opp_laner, 0)
         excluded = {c for c in [*blue.values(), *red.values()] if c}
-        prior = baseline_blue_wr if side == "blue" else (1.0 - baseline_blue_wr)
-
-        # Comparable-draft performance per champion in own_col
-        comp_n_arr = np.zeros(len(self.all_champions) + 1, dtype=np.int32)
-        comp_w_arr = np.zeros(len(self.all_champions) + 1, dtype=np.float64)
-        if len(sim_global_idx) > 0:
-            sim_cids = self.draft_mat[sim_global_idx, own_col]
-            sim_w = self.blue_win[sim_global_idx] if side == "blue" else ~self.blue_win[sim_global_idx]
-            comp_n_arr = np.bincount(sim_cids, minlength=len(self.all_champions) + 1)
-            comp_w_arr = np.bincount(sim_cids, weights=sim_w.astype(np.float64), minlength=len(self.all_champions) + 1)
-
-        # Head-to-head lane performance against opp_cid if opponent laner is locked
-        lane_n_arr = np.zeros(len(self.all_champions) + 1, dtype=np.int32)
-        lane_w_arr = np.zeros(len(self.all_champions) + 1, dtype=np.float64)
-        lane_g_arr = np.zeros(len(self.all_champions) + 1, dtype=np.float64)
-        if opp_cid > 0 and len(scoped_indices) > 0:
-            opp_mask = self.draft_mat[scoped_indices, opp_col] == opp_cid
-            lane_idx = scoped_indices[opp_mask]
-            if len(lane_idx) > 0:
-                l_cids = self.draft_mat[lane_idx, own_col]
-                l_w = self.blue_win[lane_idx] if side == "blue" else ~self.blue_win[lane_idx]
-                l_g = self.gold_Arrays[10][lane_idx] if side == "blue" else -self.gold_Arrays[10][lane_idx]
-                lane_n_arr = np.bincount(l_cids, minlength=len(self.all_champions) + 1)
-                lane_w_arr = np.bincount(l_cids, weights=l_w.astype(np.float64), minlength=len(self.all_champions) + 1)
-                lane_g_arr = np.bincount(l_cids, weights=l_g.astype(np.float64), minlength=len(self.all_champions) + 1)
 
         candidates = []
         for entry in self.role_stats_map.get(target_role, []):
             champ = entry["champion"]
             if champ in excluded or entry["matches"] < 15:
                 continue
-            cid = self.name_to_idx.get(champ, 0)
+            cid = entry["cid"]
             n_role = entry["matches"]
             wr_role = entry["win_rate"]
-            smoothed_role = (n_role * wr_role + 50.0 * prior) / (n_role + 50.0)
+            smoothed_role = (n_role * wr_role + 50.0 * 0.5) / (n_role + 50.0)
 
-            cn = int(comp_n_arr[cid])
-            c_wr = float(comp_w_arr[cid] / cn) if cn > 0 else smoothed_role
-            smoothed_comp = (cn * c_wr + 20.0 * smoothed_role) / (cn + 20.0)
-
-            ln = int(lane_n_arr[cid])
-            l_wr = float(lane_w_arr[cid] / ln) if ln > 0 else smoothed_role
-            l_g10 = float(lane_g_arr[cid] / ln) if ln > 0 else entry["mean_gold_diff_10"]
-            smoothed_lane = (ln * l_wr + 15.0 * smoothed_role) / (ln + 15.0)
-
-            if opp_cid > 0:
-                score = 0.40 * smoothed_role + 0.35 * smoothed_lane + 0.25 * smoothed_comp
+            # 1. Ally synergy across all locked teammates
+            if ally_cids:
+                syn_vals = [
+                    (self.syn_wins[cid, a_id] + 12.5) / (self.syn_games[cid, a_id] + 25.0)
+                    for a_id in ally_cids
+                ]
+                syn_wr = float(np.mean(syn_vals))
             else:
-                score = 0.55 * smoothed_role + 0.45 * smoothed_comp
+                syn_wr = smoothed_role
+
+            # 2. Counter performance across all locked enemies
+            if enemy_cids:
+                cnt_vals = [
+                    (self.cnt_wins[cid, e_id] + 12.5) / (self.cnt_games[cid, e_id] + 25.0)
+                    for e_id in enemy_cids
+                ]
+                cnt_wr = float(np.mean(cnt_vals))
+            else:
+                cnt_wr = smoothed_role
+
+            # 3. Direct head-to-head lane matchup
+            lane_n = int(self.lane_games[r_idx, cid, opp_lane_cid]) if opp_lane_cid > 0 else 0
+            if opp_lane_cid > 0 and lane_n > 0:
+                raw_lane_wr = float(self.lane_wins[r_idx, cid, opp_lane_cid] / lane_n)
+                smoothed_lane = (lane_n * raw_lane_wr + 15.0 * smoothed_role) / (lane_n + 15.0)
+                lane_g10 = float(self.lane_gold[r_idx, cid, opp_lane_cid] / lane_n)
+            else:
+                raw_lane_wr = None
+                smoothed_lane = cnt_wr
+                lane_g10 = entry["mean_gold_diff_10"]
+
+            # Dynamic weighting: heavily weight synergy, counters, and lane matchup when picks exist
+            if opp_lane_cid > 0 and (ally_cids or enemy_cids):
+                score = 0.20 * smoothed_role + 0.30 * syn_wr + 0.25 * cnt_wr + 0.25 * smoothed_lane
+            elif ally_cids or enemy_cids:
+                score = 0.25 * smoothed_role + 0.40 * syn_wr + 0.35 * cnt_wr
+            else:
+                score = smoothed_role
 
             candidates.append({
                 "champion": champ,
+                "cid": cid,
                 "role": target_role,
                 "role_label": ROLE_LABELS[target_role],
                 "archetypes": self.champ_meta.get(champ, {}).get("archetypes", "Flexible"),
                 "score": round(score * 100, 1),
                 "role_wr": round(wr_role * 100, 1),
                 "role_matches": n_role,
-                "comp_wr": round(c_wr * 100, 1) if cn > 0 else None,
-                "comp_matches": cn,
-                "lane_wr": round(l_wr * 100, 1) if (opp_cid > 0 and ln > 0) else None,
-                "lane_matches": ln if opp_cid > 0 else 0,
-                "opp_laner": opp_laner if (opp_cid > 0 and ln > 0) else None,
-                "gold_10": round(l_g10, 1),
+                "syn_wr": round(syn_wr * 100, 1) if ally_cids else None,
+                "cnt_wr": round(cnt_wr * 100, 1) if enemy_cids else None,
+                "lane_wr": round(raw_lane_wr * 100, 1) if raw_lane_wr is not None else None,
+                "lane_matches": lane_n,
+                "opp_laner": opp_laner if raw_lane_wr is not None else None,
+                "gold_10": round(lane_g10, 1),
             })
 
         candidates.sort(key=lambda x: (x["score"], x["role_matches"]), reverse=True)
         return candidates[:top_k]
+
+    def _recommend_bans_dynamic(
+        self,
+        blue: dict[str, str],
+        red: dict[str, str],
+        target_side: str,
+        top_k: int = 6,
+    ) -> list[dict[str, Any]]:
+        """
+        Recommend bans for `target_side` by finding enemy champions in the opponent's
+        remaining open roles that most strongly counter `target_side`'s locked picks
+        and synergize with the opponent's locked picks.
+        """
+        side = target_side.lower()
+        enemy_side = "red" if side == "blue" else "blue"
+        enemy_picks = red if side == "blue" else blue
+        open_enemy_roles = [r for r in ROLES if not enemy_picks.get(r)] or list(ROLES)
+
+        ban_pool = []
+        for er in open_enemy_roles:
+            er_threats = self._recommend_for_slot_dynamic(blue, red, enemy_side, er, top_k=5)
+            ban_pool.extend(er_threats)
+
+        ban_pool.sort(key=lambda x: (x["score"], x["role_matches"]), reverse=True)
+        seen = set()
+        out = []
+        for item in ban_pool:
+            if item["champion"] not in seen:
+                seen.add(item["champion"])
+                out.append(item)
+                if len(out) >= top_k:
+                    break
+        return out
 
 
 def build_spa_html(engine: FastDraftEngine, api_port: int) -> str:
@@ -640,8 +768,13 @@ def build_spa_html(engine: FastDraftEngine, api_port: int) -> str:
         "roleLabels": ROLE_LABELS,
         "roleIcons": ROLE_ICONS,
         "presets": DEMO_PRESETS,
+        "champList": engine.all_champions,        # 0-indexed list of all 172 champion names
+        "nameToCid": engine.name_to_idx,          # 1-based cid (1..172) for matrix lookups
         "champMeta": engine.champ_meta,
         "roleStats": engine.role_stats_map,
+        "synWr": engine.syn_wr_list,              # (173, 173) same-team synergy WR matrix
+        "cntWr": engine.cnt_wr_list,              # (173, 173) cross-team counter WR matrix
+        "laneMap": engine.sparse_lane_map,        # per-role head-to-head [games, wr, gold10]
         "initialDraft": initial_draft,
         "initialAnalysis": initial_analysis,
     }
@@ -663,9 +796,7 @@ def build_spa_html(engine: FastDraftEngine, api_port: int) -> str:
     --gold: #c8aa6e;
     --gold-bright: #f59e0b;
     --blue: #3b82f6;
-    --blue-glow: rgba(59, 130, 246, 0.25);
     --red: #f43f5e;
-    --red-glow: rgba(244, 63, 94, 0.25);
     --text: #f1f5f9;
     --muted: #94a3b8;
   }}
@@ -685,7 +816,6 @@ def build_spa_html(engine: FastDraftEngine, api_port: int) -> str:
     padding: 10px 16px; background: linear-gradient(90deg, #0b1324 0%, #131f3a 50%, #1a1228 100%);
     border-bottom: 1px solid var(--border);
   }}
-  .brand {{ display: flex; align-items: center; gap: 10px; }}
   .brand-title {{ font-size: 16px; font-weight: 800; letter-spacing: -0.02em; color: #fff; }}
   .brand-sub {{ font-size: 11px; color: var(--gold); text-transform: uppercase; letter-spacing: 0.08em; font-weight: 700; }}
 
@@ -696,7 +826,7 @@ def build_spa_html(engine: FastDraftEngine, api_port: int) -> str:
     cursor: pointer; transition: all 0.12s ease; display: inline-flex; align-items: center; gap: 5px;
   }}
   .btn:hover {{ background: var(--bg-hover); border-color: var(--gold); }}
-  .btn.active, .btn.gold {{ background: rgba(200, 170, 110, 0.18); border-color: var(--gold); color: #fde68a; }}
+  .btn.gold {{ background: rgba(200, 170, 110, 0.18); border-color: var(--gold); color: #fde68a; }}
   .btn.danger:hover {{ border-color: var(--red); color: #fda4af; }}
   select.ctrl {{
     background: var(--bg-card); color: var(--text); border: 1px solid var(--border);
@@ -708,7 +838,7 @@ def build_spa_html(engine: FastDraftEngine, api_port: int) -> str:
     padding: 8px 16px; background: #0a1020; border-bottom: 1px solid var(--border);
     display: flex; align-items: center; gap: 16px;
   }}
-  .win-side {{ min-width: 195px; font-weight: 800; font-size: 13px; }}
+  .win-side {{ min-width: 210px; font-weight: 800; font-size: 13px; }}
   .win-side.blue {{ color: #60a5fa; }}
   .win-side.red {{ color: #fb7185; text-align: right; }}
   .win-side small {{ display: block; font-size: 10.5px; font-weight: 500; color: var(--muted); }}
@@ -720,7 +850,7 @@ def build_spa_html(engine: FastDraftEngine, api_port: int) -> str:
   }}
   .tug-fill-blue {{
     height: 100%; background: linear-gradient(90deg, #2563eb, #60a5fa);
-    transition: width 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+    transition: width 0.22s cubic-bezier(0.4, 0, 0.2, 1);
   }}
 
   /* Main 3-Column Champion Select Arena */
@@ -818,7 +948,7 @@ def build_spa_html(engine: FastDraftEngine, api_port: int) -> str:
 
   /* Live AI Advisor Strip inside Center */
   .advisor-strip {{
-    display: grid; grid-template-columns: 1.5fr 1fr; gap: 10px; margin-bottom: 10px;
+    display: grid; grid-template-columns: 1.45fr 1fr; gap: 10px; margin-bottom: 10px;
   }}
   @media (max-width: 900px) {{ .advisor-strip {{ grid-template-columns: 1fr; }} }}
   .adv-box {{
@@ -828,24 +958,25 @@ def build_spa_html(engine: FastDraftEngine, api_port: int) -> str:
     font-size: 10.5px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.06em;
     color: var(--gold); margin-bottom: 6px; display: flex; justify-content: space-between;
   }}
-  .adv-chips {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(118px, 1fr)); gap: 6px; }}
+  .adv-chips {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(125px, 1fr)); gap: 6px; }}
   .adv-chip {{
     display: flex; align-items: center; gap: 7px; padding: 5px 7px; border-radius: 7px;
     background: var(--bg-card); border: 1px solid #26385e; cursor: pointer; transition: all 0.12s;
   }}
   .adv-chip:hover {{ border-color: var(--gold-bright); background: var(--bg-hover); transform: translateY(-1px); }}
-  .adv-chip.ban:hover {{ border-color: var(--red); }}
-  .adv-chip img {{ width: 32px; height: 32px; border-radius: 6px; border: 1px solid var(--gold); object-fit: cover; }}
+  .adv-chip.ban {{ cursor: default; }}
+  .adv-chip.ban:hover {{ border-color: var(--red); transform: none; }}
+  .adv-chip img {{ width: 34px; height: 34px; border-radius: 6px; border: 1px solid var(--gold); object-fit: cover; flex-shrink: 0; }}
   .adv-chip-info {{ min-width: 0; flex: 1; }}
   .adv-chip-name {{ font-weight: 800; font-size: 11.5px; color: #fff; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
-  .adv-chip-sub {{ font-size: 10px; color: var(--muted); white-space: nowrap; }}
+  .adv-chip-sub {{ font-size: 9.8px; color: #93c5fd; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
 
   /* Filter Bar */
   .filter-bar {{
     display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px;
     padding: 6px 8px; background: #0b1222; border-radius: 8px; border: 1px solid var(--border);
   }}
-  .role-pills {{ display: flex; gap: 4px; }}
+  .role-pills {{ display: flex; gap: 4px; flex-wrap: wrap; }}
   .role-btn {{
     background: var(--bg-card); border: 1px solid var(--border); color: var(--muted);
     padding: 4px 8px; border-radius: 6px; cursor: pointer; font-size: 11px; font-weight: 700;
@@ -874,10 +1005,10 @@ def build_spa_html(engine: FastDraftEngine, api_port: int) -> str:
     position: relative; user-select: none;
   }}
   .champ-cell:hover {{ border-color: var(--gold-bright); background: var(--bg-hover); transform: translateY(-1px); }}
-  .champ-cell.picked {{ opacity: 0.32; pointer-events: none; filter: grayscale(0.85); }}
+  .champ-cell.picked {{ opacity: 0.30; pointer-events: none; filter: grayscale(0.85); }}
   .champ-cell img {{
     width: 48px; height: 48px; border-radius: 7px; border: 1px solid rgba(200,170,110,0.6);
-    object-fit: cover; display: block; margin: 0 auto 3px;
+    object-fit: cover; display: block; margin: 0 auto 3px; background: #162038;
   }}
   .champ-cell-name {{
     font-size: 11px; font-weight: 700; color: #f8fafc;
@@ -958,7 +1089,7 @@ def build_spa_html(engine: FastDraftEngine, api_port: int) -> str:
 <div class="win-strip">
   <div class="win-side blue">
     <span id="win-blue-pct">50.0%</span> 🟦 BLUE WIN
-    <small id="win-blue-sub">Neural: — · Empirical: —</small>
+    <small id="win-blue-sub">Synergy & Matchup Estimate</small>
   </div>
   <div class="tug-container">
     <div class="tug-meta">
@@ -998,14 +1129,14 @@ def build_spa_html(engine: FastDraftEngine, api_port: int) -> str:
       <div class="adv-box">
         <div class="adv-box-header">
           <span id="rec-strip-title">✨ Top AI Picks for Active Slot</span>
-          <span style="color:var(--muted); font-weight:500;">1-Click Lock-In</span>
+          <span style="color:var(--muted); font-weight:500;">Updates Live with Synergy & Counters</span>
         </div>
         <div id="rec-chips" class="adv-chips"></div>
       </div>
       <div class="adv-box">
         <div class="adv-box-header">
-          <span>🚫 Priority Enemy Bans</span>
-          <span style="color:var(--muted); font-weight:500;">Highest Threat</span>
+          <span id="ban-strip-title">🚫 Priority Enemy Bans</span>
+          <span style="color:var(--muted); font-weight:500;">Counters Your Locked Picks</span>
         </div>
         <div id="ban-chips" class="adv-chips"></div>
       </div>
@@ -1014,7 +1145,7 @@ def build_spa_html(engine: FastDraftEngine, api_port: int) -> str:
     <!-- Filter & Search Controls -->
     <div class="filter-bar">
       <div class="role-pills" id="role-filter-pills"></div>
-      <input type="text" id="champ-search" class="search-input" placeholder="Search 172 champions by name or archetype (e.g. Ahri, Ornn, Engage)..." oninput="renderChampGrid()">
+      <input type="text" id="champ-search" class="search-input" placeholder="Search 172 champions by name or archetype (e.g. K'Sante, Ahri, Engage)..." oninput="renderChampGrid()">
       <select id="arch-filter" class="ctrl" onchange="renderChampGrid()">
         <option value="all">All Archetypes</option>
         <option value="Engage">Engage</option>
@@ -1023,8 +1154,9 @@ def build_spa_html(engine: FastDraftEngine, api_port: int) -> str:
         <option value="Split push">Split Push</option>
       </select>
       <select id="sort-filter" class="ctrl" onchange="renderChampGrid()">
-        <option value="matches">Sort: Popularity</option>
-        <option value="wr">Sort: Role Win Rate</option>
+        <option value="fit">Sort: Best Draft Fit</option>
+        <option value="matches">Sort: Role Popularity</option>
+        <option value="wr">Sort: Base Role WR</option>
         <option value="az">Sort: A → Z</option>
       </select>
     </div>
@@ -1070,7 +1202,7 @@ def build_spa_html(engine: FastDraftEngine, api_port: int) -> str:
         <div class="kpi-sub">Blue win % when behind @10m</div>
       </div>
       <div class="kpi-card">
-        <div class="kpi-label">Neural Predicted 15m Gold</div>
+        <div class="kpi-label">Predicted 15m Gold Diff</div>
         <div class="kpi-val" id="kpi-g15">—</div>
         <div class="kpi-sub" id="kpi-g15-hist">Historical mean: —</div>
       </div>
@@ -1111,7 +1243,7 @@ def build_spa_html(engine: FastDraftEngine, api_port: int) -> str:
   <div id="tab-matchups" class="tab-pane" style="display:none;">
     <div class="grid-2">
       <div class="card">
-        <div class="card-title"><span>Direct Head-to-Head Lane Matchups</span></div>
+        <div class="card-title"><span>Direct Head-to-Head Lane Matchups (751,339 Matches)</span></div>
         <div id="lane-matchup-table"></div>
       </div>
       <div class="card">
@@ -1125,43 +1257,235 @@ def build_spa_html(engine: FastDraftEngine, api_port: int) -> str:
 <script>
 const BOOT = {boot_json};
 
+// Map champion name -> 0-based index in BOOT.champList for apostrophe-proof click handlers
+const CHAMP_TO_IDX = {{}};
+BOOT.champList.forEach((c, idx) => {{ CHAMP_TO_IDX[c] = idx; }});
+
 let draftState = {{
   blue: Object.assign({{top:"", jng:"", mid:"", bot:"", sup:""}}, BOOT.initialDraft.blue),
   red: Object.assign({{top:"", jng:"", mid:"", bot:"", sup:""}}, BOOT.initialDraft.red),
 }};
 let activeSlot = {{ side: "blue", role: "sup" }};
-let roleFilter = "sup"; // "all" or role key
+let roleFilter = "sup";
 let currentAnalysis = BOOT.initialAnalysis;
 
-const FALLBACK_ICON = "https://raw.communitydragon.org/latest/plugins/rcp-be-lol-game-data/global/default/v1/champion-icons/-1.png";
-
-function champImg(name) {{
-  return (name && BOOT.champMeta[name]) ? BOOT.champMeta[name].image : FALLBACK_ICON;
+function makeMonogramSvg(name) {{
+  const initials = (name || "?").split(/[\\s'&]+/).map(w => w[0]).join("").slice(0, 2).toUpperCase();
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+    <rect width="64" height="64" rx="8" fill="#162038"/>
+    <text x="32" y="38" text-anchor="middle" fill="#c8aa6e" font-family="sans-serif" font-weight="800" font-size="22">${{initials}}</text>
+  </svg>`;
+  return "data:image/svg+xml;utf8," + encodeURIComponent(svg);
 }}
 
-function champSplash(name) {{
-  return (name && BOOT.champMeta[name]) ? BOOT.champMeta[name].splash : "";
+function handleImgError(imgEl, idx) {{
+  const name = BOOT.champList[idx] || "";
+  const meta = BOOT.champMeta[name] || {{}};
+  const step = parseInt(imgEl.dataset.fbStep || "0", 10);
+  if (step === 0 && meta.cdrag_image && imgEl.src !== meta.cdrag_image) {{
+    imgEl.dataset.fbStep = "1";
+    imgEl.src = meta.cdrag_image;
+  }} else {{
+    imgEl.onerror = null;
+    imgEl.src = makeMonogramSvg(name);
+  }}
 }}
 
-function initStudio() {{
-  document.getElementById("hdr-total").textContent = BOOT.totalMatches.toLocaleString();
-  const patchSel = document.getElementById("sel-patch");
-  BOOT.patches.forEach(p => {{
-    const opt = document.createElement("option");
-    opt.value = p;
-    opt.textContent = "Patch " + p;
-    patchSel.appendChild(opt);
+function champImgTag(name, cls = "") {{
+  const idx = CHAMP_TO_IDX[name] ?? 0;
+  const meta = BOOT.champMeta[name] || {{}};
+  const src = meta.image || makeMonogramSvg(name);
+  const clsAttr = cls ? `class="${{cls}}"` : "";
+  return `<img ${{clsAttr}} src="${{src}}" onerror="handleImgError(this, ${{idx}})" alt="">`;
+}}
+
+// ── Client-Side Instant Dynamic Recommender & Matchup Engine (0ms!) ──────────
+function computeClientDynamicRecommendations(targetSide, targetRole) {{
+  const side = targetSide.toLowerCase();
+  const ownPicks = side === "blue" ? draftState.blue : draftState.red;
+  const oppPicks = side === "blue" ? draftState.red : draftState.blue;
+
+  const allyCids = [];
+  BOOT.roles.forEach(r => {{
+    if (r !== targetRole && ownPicks[r] && BOOT.nameToCid[ownPicks[r]]) {{
+      allyCids.push(BOOT.nameToCid[ownPicks[r]]);
+    }}
   }});
-  renderRoleFilterPills();
-  renderAll();
+
+  const enemyCids = [];
+  BOOT.roles.forEach(r => {{
+    if (oppPicks[r] && BOOT.nameToCid[oppPicks[r]]) {{
+      enemyCids.push(BOOT.nameToCid[oppPicks[r]]);
+    }}
+  }});
+
+  const oppLaner = oppPicks[targetRole] || "";
+  const oppLaneCid = BOOT.nameToCid[oppLaner] || 0;
+  const excluded = new Set([...Object.values(draftState.blue), ...Object.values(draftState.red)].filter(Boolean));
+  const roleLaneMap = BOOT.laneMap[targetRole] || {{}};
+
+  const candidates = [];
+  (BOOT.roleStats[targetRole] || []).forEach(entry => {{
+    const champ = entry.champion;
+    if (excluded.has(champ) || entry.matches < 15) return;
+    const cid = entry.cid;
+    const nRole = entry.matches;
+    const wrRole = entry.win_rate;
+    const smoothedRole = (nRole * wrRole + 50.0 * 0.5) / (nRole + 50.0);
+
+    // 1. Ally Synergy across all locked allies
+    let synWr = smoothedRole;
+    if (allyCids.length > 0) {{
+      let sum = 0;
+      allyCids.forEach(aId => {{ sum += BOOT.synWr[cid][aId]; }});
+      synWr = sum / allyCids.length;
+    }}
+
+    // 2. Enemy Counter across all locked enemies
+    let cntWr = smoothedRole;
+    if (enemyCids.length > 0) {{
+      let sum = 0;
+      enemyCids.forEach(eId => {{ sum += BOOT.cntWr[cid][eId]; }});
+      cntWr = sum / enemyCids.length;
+    }}
+
+    // 3. Direct Lane Matchup vs oppLaner
+    let rawLaneWr = null;
+    let laneMatches = 0;
+    let laneGold10 = entry.mean_gold_diff_10;
+    let smoothedLane = cntWr;
+    if (oppLaneCid > 0) {{
+      const lEntry = roleLaneMap[`${{cid}}_${{oppLaneCid}}`];
+      if (lEntry && lEntry[0] > 0) {{
+        laneMatches = lEntry[0];
+        rawLaneWr = lEntry[1];
+        laneGold10 = lEntry[2];
+        smoothedLane = (laneMatches * rawLaneWr + 15.0 * smoothedRole) / (laneMatches + 15.0);
+      }}
+    }}
+
+    let score = smoothedRole;
+    if (oppLaneCid > 0 && (allyCids.length > 0 || enemyCids.length > 0)) {{
+      score = 0.20 * smoothedRole + 0.30 * synWr + 0.25 * cntWr + 0.25 * smoothedLane;
+    }} else if (allyCids.length > 0 || enemyCids.length > 0) {{
+      score = 0.25 * smoothedRole + 0.40 * synWr + 0.35 * cntWr;
+    }}
+
+    const meta = BOOT.champMeta[champ] || {{}};
+    candidates.push({{
+      champion: champ,
+      idx: CHAMP_TO_IDX[champ],
+      cid: cid,
+      role: targetRole,
+      role_label: BOOT.roleLabels[targetRole],
+      archetypes: meta.archetypes || "Flexible",
+      score: parseFloat((score * 100).toFixed(1)),
+      role_wr: parseFloat((wrRole * 100).toFixed(1)),
+      role_matches: nRole,
+      syn_wr: allyCids.length > 0 ? parseFloat((synWr * 100).toFixed(1)) : null,
+      cnt_wr: enemyCids.length > 0 ? parseFloat((cntWr * 100).toFixed(1)) : null,
+      lane_wr: rawLaneWr !== null ? parseFloat((rawLaneWr * 100).toFixed(1)) : null,
+      lane_matches: laneMatches,
+      opp_laner: rawLaneWr !== null ? oppLaner : null,
+      gold_10: laneGold10,
+    }});
+  }});
+
+  candidates.sort((a, b) => (b.score - a.score) || (b.role_matches - a.role_matches));
+  return candidates;
 }}
+
+function computeClientDynamicBans(targetSide) {{
+  const side = targetSide.toLowerCase();
+  const enemySide = side === "blue" ? "red" : "blue";
+  const enemyPicks = side === "blue" ? draftState.red : draftState.blue;
+  let openEnemyRoles = BOOT.roles.filter(r => !enemyPicks[r]);
+  if (openEnemyRoles.length === 0) openEnemyRoles = [...BOOT.roles];
+
+  const pool = [];
+  openEnemyRoles.forEach(er => {{
+    const threats = computeClientDynamicRecommendations(enemySide, er).slice(0, 5);
+    pool.push(...threats);
+  }});
+  pool.sort((a, b) => (b.score - a.score) || (b.role_matches - a.role_matches));
+  const seen = new Set();
+  const out = [];
+  for (const item of pool) {{
+    if (!seen.has(item.champion)) {{
+      seen.add(item.champion);
+      out.push(item);
+      if (out.length >= 6) break;
+    }}
+  }}
+  return out;
+}}
+
+function computeClientLaneMatchups() {{
+  const rows = [];
+  BOOT.roles.forEach(r => {{
+    const bName = draftState.blue[r];
+    const rName = draftState.red[r];
+    if (bName && rName) {{
+      const bCid = BOOT.nameToCid[bName] || 0;
+      const rCid = BOOT.nameToCid[rName] || 0;
+      const lEntry = (BOOT.laneMap[r] || {{}})[`${{bCid}}_${{rCid}}`];
+      rows.push({{
+        role: r,
+        role_label: BOOT.roleLabels[r],
+        blue_champ: bName,
+        red_champ: rName,
+        matches: lEntry ? lEntry[0] : 0,
+        blue_wr: lEntry ? lEntry[1] : null,
+        gold_10: lEntry ? lEntry[2] : null,
+      }});
+    }}
+  }});
+  return rows;
+}}
+
+function computeClientWinEstimate() {{
+  // Combine role base strength, within-team synergy, and cross-team counters for locked picks
+  const bCids = BOOT.roles.map(r => BOOT.nameToCid[draftState.blue[r]] || 0).filter(x => x > 0);
+  const rCids = BOOT.roles.map(r => BOOT.nameToCid[draftState.red[r]] || 0).filter(x => x > 0);
+  if (bCids.length === 0 && rCids.length === 0) return 0.5;
+
+  let bEdges = [];
+  // Role base win rates
+  BOOT.roles.forEach(r => {{
+    const bc = draftState.blue[r];
+    const rc = draftState.red[r];
+    const rList = BOOT.roleStats[r] || [];
+    if (bc) {{
+      const st = rList.find(x => x.champion === bc);
+      if (st) bEdges.push(st.win_rate);
+    }}
+    if (rc) {{
+      const st = rList.find(x => x.champion === rc);
+      if (st) bEdges.push(1.0 - st.win_rate);
+    }}
+  }});
+  // Blue pairwise synergy
+  for (let i = 0; i < bCids.length; i++) {{
+    for (let j = i + 1; j < bCids.length; j++) bEdges.push(BOOT.synWr[bCids[i]][bCids[j]]);
+  }}
+  // Red pairwise synergy (inverted for Blue)
+  for (let i = 0; i < rCids.length; i++) {{
+    for (let j = i + 1; j < rCids.length; j++) bEdges.push(1.0 - BOOT.synWr[rCids[i]][rCids[j]]);
+  }}
+  // Cross-team counters
+  bCids.forEach(bc => {{
+    rCids.forEach(rc => {{ bEdges.push(BOOT.cntWr[bc][rc]); }});
+  }});
+  const meanWr = bEdges.reduce((a, b) => a + b, 0) / Math.max(1, bEdges.length);
+  return Math.min(0.68, Math.max(0.32, 0.5 + (meanWr - 0.5) * 2.2));
+}}
+
+// ── UI Actions (All Apostrophe-Safe via Integer Index!) ───────────────────────
 
 function selectSlot(side, role) {{
   activeSlot = {{ side, role }};
-  roleFilter = role; // Auto-sync grid role filter to clicked slot!
-  renderRoleFilterPills();
-  renderSlots();
-  renderBannerAndGrid();
+  roleFilter = role;
+  refreshUIInstant();
   triggerAnalyze();
 }}
 
@@ -1170,22 +1494,14 @@ function clearSlot(ev, side, role) {{
   draftState[side][role] = "";
   activeSlot = {{ side, role }};
   roleFilter = role;
-  renderRoleFilterPills();
-  renderSlots();
-  renderBannerAndGrid();
+  refreshUIInstant();
   triggerAnalyze();
 }}
 
-function pickChampion(champName) {{
+function pickChampByIdx(idx) {{
+  const champName = BOOT.champList[idx];
+  if (!champName) return;
   const {{ side, role }} = activeSlot;
-  if (!champName || !BOOT.champMeta[champName]) return;
-  const pickedElsewhere = new Set([
-    ...Object.values(draftState.blue),
-    ...Object.values(draftState.red),
-  ]);
-  if (pickedElsewhere.has(champName) && draftState[side][role] !== champName) {{
-    return;
-  }}
   draftState[side][role] = champName;
 
   // Auto-advance cursor to next open slot
@@ -1200,9 +1516,7 @@ function pickChampion(champName) {{
       break;
     }}
   }}
-  renderRoleFilterPills();
-  renderSlots();
-  renderBannerAndGrid();
+  refreshUIInstant();
   triggerAnalyze();
 }}
 
@@ -1213,7 +1527,6 @@ function loadPreset(name) {{
     draftState.blue[r] = p.blue[r] || "";
     draftState.red[r] = p.red[r] || "";
   }});
-  // Set activeSlot to first open slot or blue top
   let found = null;
   BOOT.roles.forEach(r => {{
     if (!found && !draftState.blue[r]) found = {{side:"blue", role:r}};
@@ -1221,9 +1534,7 @@ function loadPreset(name) {{
   }});
   activeSlot = found || {{side:"blue", role:"top"}};
   roleFilter = activeSlot.role;
-  renderRoleFilterPills();
-  renderSlots();
-  renderBannerAndGrid();
+  refreshUIInstant();
   triggerAnalyze();
 }}
 
@@ -1241,8 +1552,7 @@ function randomizeDraft() {{
       used.add(c1); used.add(c2);
     }}
   }});
-  renderSlots();
-  renderBannerAndGrid();
+  refreshUIInstant();
   triggerAnalyze();
 }}
 
@@ -1250,8 +1560,7 @@ function swapSides() {{
   const bCopy = Object.assign({{}}, draftState.blue);
   draftState.blue = Object.assign({{}}, draftState.red);
   draftState.red = bCopy;
-  renderSlots();
-  renderBannerAndGrid();
+  refreshUIInstant();
   triggerAnalyze();
 }}
 
@@ -1259,9 +1568,7 @@ function clearDraft() {{
   BOOT.roles.forEach(r => {{ draftState.blue[r] = ""; draftState.red[r] = ""; }});
   activeSlot = {{side:"blue", role:"top"}};
   roleFilter = "top";
-  renderRoleFilterPills();
-  renderSlots();
-  renderBannerAndGrid();
+  refreshUIInstant();
   triggerAnalyze();
 }}
 
@@ -1297,13 +1604,14 @@ function renderSlots() {{
 
       if (champ && BOOT.champMeta[champ]) {{
         const meta = BOOT.champMeta[champ];
+        const idx = CHAMP_TO_IDX[champ] ?? 0;
         const rStat = (BOOT.roleStats[role] || []).find(x => x.champion === champ);
         const wrTxt = rStat ? `${{(rStat.win_rate * 100).toFixed(1)}}% WR` : meta.title;
         html += `
           <div class="slot ${{side}} ${{isAct}}" onclick="selectSlot('${{side}}', '${{role}}')">
             <div class="slot-splash" style="background-image:url('${{meta.splash}}')"></div>
             <div class="slot-scrim"></div>
-            <img class="slot-icon" src="${{meta.image}}" alt="${{champ}}">
+            <img class="slot-icon" src="${{meta.image}}" onerror="handleImgError(this, ${{idx}})" alt="">
             <div class="slot-body">
               <div class="slot-role-row"><img src="${{rIcon}}" width="12" height="12"> ${{rLabel}}</div>
               <div class="slot-name">${{champ}}</div>
@@ -1329,17 +1637,65 @@ function renderSlots() {{
   }});
 }}
 
-function renderBannerAndGrid() {{
+function renderAdvisorAndGridInstant() {{
   const sBadge = activeSlot.side === "blue" ? "🟦 BLUE" : "🟥 RED";
   const cur = draftState[activeSlot.side][activeSlot.role] || "Open Slot";
   document.getElementById("active-slot-banner").innerHTML =
     `🎯 Active Slot: <span>${{sBadge}} · ${{BOOT.roleLabels[activeSlot.role].toUpperCase()}}</span> <span style="color:var(--gold);">(${{cur}})</span>`;
   document.getElementById("rec-strip-title").textContent =
     `✨ Top AI Picks · ${{activeSlot.side.toUpperCase()}} ${{BOOT.roleLabels[activeSlot.role]}}`;
-  renderChampGrid();
+  const enemySideLabel = activeSlot.side === "blue" ? "RED" : "BLUE";
+  document.getElementById("ban-strip-title").textContent =
+    `🚫 Priority ${{enemySideLabel}} Bans (Open Roles)`;
+
+  // 1. Recompute Dynamic Recommendations & Bans in 0ms on the client!
+  const recs = computeClientDynamicRecommendations(activeSlot.side, activeSlot.role);
+  const bans = computeClientDynamicBans(activeSlot.side);
+
+  // Render Top 4 Pick Chips (using integer index pickChampByIdx!)
+  const recBox = document.getElementById("rec-chips");
+  recBox.innerHTML = recs.slice(0, 4).map(r => {{
+    let detail = `WR ${{r.role_wr}}%`;
+    if (r.lane_wr !== null) detail = `Vs ${{r.opp_laner}}: ${{r.lane_wr}}%`;
+    else if (r.syn_wr !== null) detail = `Syn ${{r.syn_wr}}%`;
+    return `<div class="adv-chip" onclick="pickChampByIdx(${{r.idx}})" title="Click to lock in ${{r.champion}} into ${{activeSlot.side.toUpperCase()}} ${{BOOT.roleLabels[activeSlot.role]}}">
+      ${{champImgTag(r.champion)}}
+      <div class="adv-chip-info">
+        <div class="adv-chip-name">${{r.champion}}</div>
+        <div class="adv-chip-sub"><b>${{r.score}}</b> · ${{detail}}</div>
+      </div>
+    </div>`;
+  }}).join("") || `<div style="color:var(--muted); font-size:11px;">No candidates available.</div>`;
+
+  // Render Top 3 Ban Chips
+  const banBox = document.getElementById("ban-chips");
+  banBox.innerHTML = bans.slice(0, 3).map(b => {{
+    const detail = b.cnt_wr !== null ? `Vs You: ${{b.cnt_wr}}%` : `WR ${{b.role_wr}}%`;
+    return `<div class="adv-chip ban" title="High threat in enemy ${{b.role_label}}">
+      ${{champImgTag(b.champion)}}
+      <div class="adv-chip-info">
+        <div class="adv-chip-name">${{b.champion}}</div>
+        <div class="adv-chip-sub">${{b.role_label}} · <b>${{b.score}}</b> (${{detail}})</div>
+      </div>
+    </div>`;
+  }}).join("");
+
+  // Also update the Full Candidate Table & Lane Matchups Table immediately in 0ms
+  renderMatchupsAndAdvisorTables({{
+    lane_matchups: computeClientLaneMatchups(),
+    recommendations: recs.slice(0, 12),
+  }});
+
+  // Update instant client-side Win Estimate while backend /api/analyze is in flight
+  const estWr = computeClientWinEstimate();
+  document.getElementById("win-blue-pct").textContent = (estWr * 100).toFixed(1) + "%";
+  document.getElementById("win-red-pct").textContent = ((1 - estWr) * 100).toFixed(1) + "%";
+  document.getElementById("tug-bar-blue").style.width = (estWr * 100).toFixed(1) + "%";
+
+  renderChampGrid(recs);
 }}
 
-function renderChampGrid() {{
+function renderChampGrid(cachedRecs) {{
   const query = (document.getElementById("champ-search").value || "").trim().toLowerCase();
   const arch = document.getElementById("arch-filter").value;
   const sortMode = document.getElementById("sort-filter").value;
@@ -1356,22 +1712,31 @@ function renderChampGrid() {{
     roleMap[entry.champion] = entry;
   }});
 
-  let pool = Object.keys(BOOT.champMeta);
+  const fitMap = {{}};
+  const recs = cachedRecs || computeClientDynamicRecommendations(activeSlot.side, targetRole);
+  recs.forEach(r => {{ fitMap[r.champion] = r.score; }});
+
+  let pool = [...BOOT.champList];
   if (roleFilter !== "all" && !query) {{
     pool = pool.filter(c => roleMap[c] && roleMap[c].matches >= 15);
   }}
   if (query) {{
     pool = pool.filter(c => {{
-      const m = BOOT.champMeta[c];
+      const m = BOOT.champMeta[c] || {{}};
       return c.toLowerCase().includes(query) || (m.archetypes || "").toLowerCase().includes(query);
     }});
   }}
   if (arch !== "all") {{
-    pool = pool.filter(c => (BOOT.champMeta[c].arch_list || []).includes(arch));
+    pool = pool.filter(c => ((BOOT.champMeta[c] || {{}}).arch_list || []).includes(arch));
   }}
 
   pool.sort((a, b) => {{
     if (sortMode === "az") return a.localeCompare(b);
+    if (sortMode === "fit") {{
+      const fa = fitMap[a] ?? 0;
+      const fb = fitMap[b] ?? 0;
+      if (fb !== fa) return fb - fa;
+    }}
     const ra = roleMap[a] || {{ matches: 0, win_rate: 0 }};
     const rb = roleMap[b] || {{ matches: 0, win_rate: 0 }};
     if (sortMode === "wr") return (rb.win_rate - ra.win_rate) || (rb.matches - ra.matches);
@@ -1381,14 +1746,18 @@ function renderChampGrid() {{
   const grid = document.getElementById("champ-grid");
   let html = "";
   pool.forEach(c => {{
-    const meta = BOOT.champMeta[c];
+    const idx = CHAMP_TO_IDX[c];
+    const meta = BOOT.champMeta[c] || {{}};
     const rStat = roleMap[c];
-    const subTxt = rStat ? `${{(rStat.win_rate * 100).toFixed(1)}}%` : (meta.arch_list[0] || "Flex");
+    const fitScore = fitMap[c];
+    const subTxt = (sortMode === "fit" && fitScore)
+      ? `Fit ${{fitScore}}`
+      : (rStat ? `${{(rStat.win_rate * 100).toFixed(1)}}%` : ((meta.arch_list || [])[0] || "Flex"));
     const isPicked = pickedSet.has(c) && c !== curSlotChamp;
-    const clickArg = JSON.stringify(c);
+
     html += `
-      <div class="champ-cell ${{isPicked ? 'picked' : ''}}" onclick='pickChampion(${{clickArg}})' title="${{c}} (${{meta.archetypes}})">
-        <img src="${{meta.image}}" loading="lazy" alt="${{c}}">
+      <div class="champ-cell ${{isPicked ? 'picked' : ''}}" onclick="pickChampByIdx(${{idx}})" title="${{c}} (${{meta.archetypes || 'Flex'}})">
+        ${{champImgTag(c)}}
         <div class="champ-cell-name">${{c}}</div>
         <div class="champ-cell-wr">${{subTxt}}</div>
       </div>`;
@@ -1396,7 +1765,7 @@ function renderChampGrid() {{
   grid.innerHTML = html || `<div style="grid-column:1/-1; color:var(--muted); padding:16px; text-align:center;">No champions match filter. Click 'All (172)' to view full roster.</div>`;
 }}
 
-function renderAnalysis(data) {{
+function renderServerAnalysis(data) {{
   currentAnalysis = data;
   const hasNeural = Boolean(data.neural);
   const bWr = hasNeural ? data.neural.blue_win_prob : data.observed_blue_wr;
@@ -1412,35 +1781,6 @@ function renderAnalysis(data) {{
   document.getElementById("tug-mode-label").textContent = data.resolved_mode;
   document.getElementById("tug-sample-label").textContent = `${{data.similar_matches.toLocaleString()}} comparable matches`;
 
-  // Top AI Pick Chips
-  const recBox = document.getElementById("rec-chips");
-  const topRecs = (data.recommendations || []).slice(0, 4);
-  recBox.innerHTML = topRecs.map(r => {{
-    const clickArg = JSON.stringify(r.champion);
-    const laneTxt = r.lane_wr !== null ? `Lane ${{r.lane_wr}}%` : `WR ${{r.role_wr}}%`;
-    return `<div class="adv-chip" onclick='pickChampion(${{clickArg}})' title="Click to lock in ${{r.champion}}">
-      <img src="${{champImg(r.champion)}}" alt="">
-      <div class="adv-chip-info">
-        <div class="adv-chip-name">${{r.champion}}</div>
-        <div class="adv-chip-sub">Score ${{r.score}} · ${{laneTxt}}</div>
-      </div>
-    </div>`;
-  }}).join("") || `<div style="color:var(--muted); font-size:11px;">Select picks to compute recommendations.</div>`;
-
-  // Top Ban Chips
-  const banBox = document.getElementById("ban-chips");
-  const topBans = (data.bans || []).slice(0, 3);
-  banBox.innerHTML = topBans.map(b => {{
-    return `<div class="adv-chip ban" title="High threat in enemy ${{b.role_label}}">
-      <img src="${{champImg(b.champion)}}" alt="">
-      <div class="adv-chip-info">
-        <div class="adv-chip-name">${{b.champion}}</div>
-        <div class="adv-chip-sub">${{b.role_label}} · Threat ${{b.score}}</div>
-      </div>
-    </div>`;
-  }}).join("");
-
-  // KPIs
   const delta = ((data.observed_blue_wr - data.baseline_wr) * 100).toFixed(1);
   document.getElementById("kpi-wr").textContent = (data.observed_blue_wr * 100).toFixed(1) + "%";
   document.getElementById("kpi-wr-ci").textContent = `${{delta >= 0 ? '+' : ''}}${{delta}} pts vs baseline (${{(data.ci_low*100).toFixed(1)}}%–${{(data.ci_high*100).toFixed(1)}}%)`;
@@ -1455,7 +1795,6 @@ function renderAnalysis(data) {{
   renderGoldSvg(data.gold_curve_hist, hasNeural ? data.neural.gold_curve : null);
   renderArchAndLadder(data);
   renderObjectivesTables(data);
-  renderMatchupsAndAdvisorTables(data);
 }}
 
 function renderGoldSvg(histCurve, neuralCurve) {{
@@ -1572,8 +1911,8 @@ function renderMatchupsAndAdvisorTables(data) {{
         <tbody>
           ${{matchups.map(m => `<tr>
             <td><b>${{m.role_label}}</b></td>
-            <td><div class="td-champ"><img src="${{champImg(m.blue_champ)}}">${{m.blue_champ}}</div></td>
-            <td><div class="td-champ"><img src="${{champImg(m.red_champ)}}">${{m.red_champ}}</div></td>
+            <td><div class="td-champ">${{champImgTag(m.blue_champ)}}${{m.blue_champ}}</div></td>
+            <td><div class="td-champ">${{champImgTag(m.red_champ)}}${{m.red_champ}}</div></td>
             <td>${{m.matches.toLocaleString()}}</td>
             <td style="color:${{(m.blue_wr||0.5)>=0.5?'#60a5fa':'#fb7185'}}; font-weight:700;">${{m.blue_wr !== null ? (m.blue_wr*100).toFixed(1)+'%' : '—'}}</td>
             <td>${{m.gold_10 !== null ? (m.gold_10>=0?'+':'')+m.gold_10+'g' : '—'}}</td>
@@ -1588,17 +1927,17 @@ function renderMatchupsAndAdvisorTables(data) {{
   const recs = data.recommendations || [];
   rBox.innerHTML = `
     <table class="data-table">
-      <thead><tr><th>Champion</th><th>Archetype</th><th>Score</th><th>Role WR</th><th>Lane vs Opp</th><th>Gold @10m</th></tr></thead>
+      <thead><tr><th>Champion</th><th>Fit Score</th><th>Role WR</th><th>Ally Synergy</th><th>Enemy Counter</th><th>Lane vs Opp</th></tr></thead>
       <tbody>
         ${{recs.map(r => {{
-          const clickArg = JSON.stringify(r.champion);
-          return `<tr style="cursor:pointer;" onclick='pickChampion(${{clickArg}})'>
-            <td><div class="td-champ"><img src="${{champImg(r.champion)}}">${{r.champion}}</div></td>
-            <td><span class="arch-tag">${{r.archetypes}}</span></td>
+          const idx = CHAMP_TO_IDX[r.champion] ?? r.idx ?? 0;
+          return `<tr style="cursor:pointer;" onclick="pickChampByIdx(${{idx}})">
+            <td><div class="td-champ">${{champImgTag(r.champion)}}${{r.champion}}</div></td>
             <td><b style="color:var(--gold-bright);">${{r.score}}</b></td>
-            <td>${{r.role_wr}}% <small style="color:var(--muted);">(${{r.role_matches.toLocaleString()}})</small></td>
-            <td>${{r.lane_wr !== null ? r.lane_wr+'% ('+r.lane_matches+')' : '—'}}</td>
-            <td>${{r.gold_10 >= 0 ? '+' : ''}}${{r.gold_10}}g</td>
+            <td>${{r.role_wr}}%</td>
+            <td style="color:#60a5fa;">${{r.syn_wr !== null && r.syn_wr !== undefined ? r.syn_wr+'%' : '—'}}</td>
+            <td style="color:#34d399;">${{r.cnt_wr !== null && r.cnt_wr !== undefined ? r.cnt_wr+'%' : '—'}}</td>
+            <td>${{r.lane_wr !== null && r.lane_wr !== undefined ? r.lane_wr+'% ('+r.lane_matches+')' : '—'}}</td>
           </tr>`;
         }}).join("")}}
       </tbody>
@@ -1614,36 +1953,56 @@ function switchTab(tabId, btn) {{
 
 let analyzeController = null;
 async function triggerAnalyze() {{
-  const payload = {{
+  const payload = JSON.stringify({{
     blue: draftState.blue,
     red: draftState.red,
     active_side: activeSlot.side,
     active_role: activeSlot.role,
     mode: document.getElementById("sel-mode").value,
     patch: document.getElementById("sel-patch").value,
-  }};
+  }});
+  const host = (window.location && window.location.hostname) ? window.location.hostname : "127.0.0.1";
   try {{
     if (analyzeController) analyzeController.abort();
     analyzeController = new AbortController();
-    const res = await fetch(`http://127.0.0.1:${{BOOT.apiPort}}/api/analyze`, {{
+    // Use text/plain Simple Request to avoid CORS/Private-Network preflight blocking
+    const res = await fetch(`http://${{host}}:${{BOOT.apiPort}}/api/analyze`, {{
       method: "POST",
-      headers: {{ "Content-Type": "application/json" }},
-      body: JSON.stringify(payload),
+      body: payload,
       signal: analyzeController.signal,
     }});
     if (res.ok) {{
       const data = await res.json();
-      renderAnalysis(data);
+      renderServerAnalysis(data);
     }}
   }} catch (err) {{
-    if (err.name !== "AbortError") console.warn("Local API call error:", err);
+    if (err.name !== "AbortError") {{
+      // Fallback to 127.0.0.1 if hostname differed
+      try {{
+        const res2 = await fetch(`http://127.0.0.1:${{BOOT.apiPort}}/api/analyze`, {{ method: "POST", body: payload }});
+        if (res2.ok) renderServerAnalysis(await res2.json());
+      }} catch (_) {{}}
+    }}
   }}
 }}
 
-function renderAll() {{
+function refreshUIInstant() {{
+  renderRoleFilterPills();
   renderSlots();
-  renderBannerAndGrid();
-  renderAnalysis(currentAnalysis);
+  renderAdvisorAndGridInstant();
+}}
+
+function initStudio() {{
+  document.getElementById("hdr-total").textContent = BOOT.totalMatches.toLocaleString();
+  const patchSel = document.getElementById("sel-patch");
+  BOOT.patches.forEach(p => {{
+    const opt = document.createElement("option");
+    opt.value = p;
+    opt.textContent = "Patch " + p;
+    patchSel.appendChild(opt);
+  }});
+  refreshUIInstant();
+  renderServerAnalysis(currentAnalysis);
 }}
 
 initStudio();
@@ -1657,12 +2016,13 @@ class _StudioAPIHandler(BaseHTTPRequestHandler):
     api_port: int = 8765
 
     def log_message(self, format: str, *args: Any) -> None:
-        return  # Keep console clean
+        return
 
     def _send_cors(self) -> None:
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Allow-Headers", "*")
+        self.send_header("Access-Control-Allow-Private-Network", "true")
 
     def do_OPTIONS(self) -> None:
         self.send_response(204)
@@ -1759,7 +2119,6 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    # Support both `streamlit run app.py` and direct `python app.py`
     if "streamlit" in sys.modules or any("streamlit" in arg.lower() for arg in sys.argv):
         main()
     else:
