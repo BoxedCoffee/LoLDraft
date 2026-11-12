@@ -18,7 +18,6 @@ import math
 import random
 import sys
 from pathlib import Path
-from urllib.parse import urlencode
 
 import numpy as np
 import pandas as pd
@@ -182,12 +181,10 @@ st.markdown(
         background: #111a2e; border: 1px solid #293856; border-radius: 10px;
         padding: .35rem; text-align: center; margin-bottom: .15rem;
     }
-        .champ-pick-link {
-            display: block; color: inherit; text-decoration: none; border-radius: 9px;
-            transition: transform .12s ease, filter .12s ease;
+        .champ-pick-button > button {
+            min-height: 2.2rem; margin-top: -.25rem; border-color: #3b82f6;
+            color: #e2e8f0; font-size: .72rem;
         }
-        .champ-pick-link:hover {transform: translateY(-2px); filter: brightness(1.2);}
-        .champ-pick-link:focus-visible {outline: 2px solid #f59e0b; outline-offset: 2px;}
     .champ-tile img {
         width: 54px; height: 54px; border-radius: 8px; border: 1.5px solid #c8aa6e;
         object-fit: cover; display: block; margin: 0 auto .2rem;
@@ -644,54 +641,6 @@ def cb_clear_all() -> None:
     st.session_state["active_slot"] = ("blue", "top")
 
 
-def pick_query_href(side: str, role: str, champion: str) -> str:
-    return "?" + urlencode(
-        {"pick_side": side, "pick_role": role, "pick_champion": champion}
-    )
-
-
-def target_query_href(side: str, role: str) -> str:
-    return "?" + urlencode({"target_side": side, "target_role": role})
-
-
-def apply_query_action(champ_meta: dict[str, dict]) -> None:
-    """Apply a portrait/link action once, then remove it from the URL."""
-    if hasattr(st, "query_params"):
-        params = st.query_params
-    else:
-        params = st.experimental_get_query_params()
-
-    def value(key: str) -> str | None:
-        item = params.get(key)
-        if isinstance(item, list):
-            return item[0] if item else None
-        return item
-
-    pick_side = value("pick_side")
-    pick_role = value("pick_role")
-    pick_champion = value("pick_champion")
-    target_side = value("target_side")
-    target_role = value("target_role")
-
-    if pick_side in ("blue", "red") and pick_role in ROLES and pick_champion in champ_meta:
-        selected = {
-            value
-            for side in ("blue", "red")
-            for role, value in st.session_state["draft_state"][side].items()
-            if value and (side, role) != (pick_side, pick_role)
-        }
-        if pick_champion not in selected:
-            cb_pick_champion(pick_side, pick_role, pick_champion)
-    elif target_side in ("blue", "red") and target_role in ROLES:
-        cb_target_slot(target_side, target_role)
-
-    if pick_side or target_side:
-        if hasattr(st, "query_params"):
-            st.query_params.clear()
-        else:
-            st.experimental_set_query_params()
-
-
 def render_slot_card_html(
     side: str, role: str, champion: str, is_active: bool, champ_meta: dict[str, dict]
 ) -> str:
@@ -743,13 +692,15 @@ def render_interactive_team_column(
     for role in ROLES:
         champ = picks.get(role, "")
         is_active = active_slot == (side, role)
-        target_href = html.escape(target_query_href(side, role), quote=True)
         card_html = render_slot_card_html(side, role, champ, is_active, champ_meta)
-        st.markdown(
-            f'<a class="champ-pick-link" href="{target_href}" target="_self" '
-            f'aria-label="Edit {html.escape(side.title())} {html.escape(ROLE_LABELS[role])}">'
-            f"{card_html}</a>",
-            unsafe_allow_html=True,
+        st.markdown(card_html, unsafe_allow_html=True)
+        st.button(
+            "🎯 Target slot" if not is_active else "🎯 Slot targeted",
+            key=f"target_{side}_{role}",
+            type="primary" if is_active else "secondary",
+            use_container_width=True,
+            on_click=cb_target_slot,
+            args=(side, role),
         )
         if champ:
             st.button(
@@ -765,7 +716,6 @@ def main() -> None:
     table, stats, mapping, champ_meta = load_studio_artifacts()
     predictor = load_neural_predictor()
     init_draft_state()
-    apply_query_action(champ_meta)
 
     all_champions = sorted(
         set(champ_meta.keys()) if champ_meta else (
@@ -925,18 +875,20 @@ def main() -> None:
                 c_score = getattr(row, "_3", 50.0)
                 c_wr = getattr(row, "_4", "—")
                 with rec_cols[r_idx]:
-                    href = html.escape(
-                        pick_query_href(active_side, active_role, c_name), quote=True
-                    )
                     st.markdown(
-                        f'<a class="champ-pick-link" href="{href}" target="_self" '
-                        f'aria-label="Pick {html.escape(c_name)}">'
                         f'<div class="champ-tile">'
                         f'<img src="{c_img}" alt="{html.escape(c_name)}">'
                         f'<div class="champ-tile-name">{html.escape(c_name)}</div>'
                         f'<div class="champ-tile-meta">Score {c_score} · {html.escape(str(c_wr))}</div>'
-                        f'</div></a>',
+                        f'</div>',
                         unsafe_allow_html=True,
+                    )
+                    st.button(
+                        f"Pick {c_name}",
+                        key=f"center_rec_{active_side}_{active_role}_{c_name}",
+                        use_container_width=True,
+                        on_click=cb_pick_champion,
+                        args=(active_side, active_role, c_name),
                     )
 
         f_col1, f_col2, f_col3 = st.columns([1.2, 1.1, 1.1], gap="small")
@@ -1018,13 +970,16 @@ def main() -> None:
                     if is_taken:
                         st.markdown(tile, unsafe_allow_html=True)
                     else:
-                        href = html.escape(
-                            pick_query_href(active_side, active_role, c_name), quote=True
-                        )
                         st.markdown(
-                            f'<a class="champ-pick-link" href="{href}" target="_self" '
-                            f'aria-label="Pick {html.escape(c_name)}">{tile}</a>',
+                            tile,
                             unsafe_allow_html=True,
+                        )
+                        st.button(
+                            f"Pick {c_name}",
+                            key=f"grid_pick_{active_side}_{active_role}_{c_name}",
+                            use_container_width=True,
+                            on_click=cb_pick_champion,
+                            args=(active_side, active_role, c_name),
                         )
 
     # ── Live Summary Metrics & Tug-of-War Win Bar ──
