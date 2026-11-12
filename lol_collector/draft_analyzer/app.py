@@ -746,7 +746,7 @@ def render_interactive_team_column(
         target_href = html.escape(target_query_href(side, role), quote=True)
         card_html = render_slot_card_html(side, role, champ, is_active, champ_meta)
         st.markdown(
-            f'<a class="champ-pick-link" href="{target_href}" '
+            f'<a class="champ-pick-link" href="{target_href}" target="_self" '
             f'aria-label="Edit {html.escape(side.title())} {html.escape(ROLE_LABELS[role])}">'
             f"{card_html}</a>",
             unsafe_allow_html=True,
@@ -929,7 +929,7 @@ def main() -> None:
                         pick_query_href(active_side, active_role, c_name), quote=True
                     )
                     st.markdown(
-                        f'<a class="champ-pick-link" href="{href}" '
+                        f'<a class="champ-pick-link" href="{href}" target="_self" '
                         f'aria-label="Pick {html.escape(c_name)}">'
                         f'<div class="champ-tile">'
                         f'<img src="{c_img}" alt="{html.escape(c_name)}">'
@@ -1022,7 +1022,7 @@ def main() -> None:
                             pick_query_href(active_side, active_role, c_name), quote=True
                         )
                         st.markdown(
-                            f'<a class="champ-pick-link" href="{href}" '
+                            f'<a class="champ-pick-link" href="{href}" target="_self" '
                             f'aria-label="Pick {html.escape(c_name)}">{tile}</a>',
                             unsafe_allow_html=True,
                         )
