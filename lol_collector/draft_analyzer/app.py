@@ -258,8 +258,18 @@ def load_studio_artifacts():
     Keep the 751,339-row match table and metadata in memory as a shared resource
     so Streamlit never hashes or re-pickles the DataFrame on button clicks.
     """
-    table = pd.read_parquet(OUTPUT_DIR / "match_analysis.parquet")
-    stats = pd.read_parquet(OUTPUT_DIR / "champion_role_stats.parquet")
+    match_path = OUTPUT_DIR / "match_analysis.parquet"
+    stats_path = OUTPUT_DIR / "champion_role_stats.parquet"
+    missing = [str(path.relative_to(APP_DIR.parent.parent)) for path in (match_path, stats_path) if not path.exists()]
+    if missing:
+        raise FileNotFoundError(
+            "Required Draft Analyzer artifacts are missing: "
+            + ", ".join(missing)
+            + ". Run `python analysis.py --data-dir ../draft_encoder/data/processed_riot "
+            "--output-dir analysis_output` before deploying."
+        )
+    table = pd.read_parquet(match_path)
+    stats = pd.read_parquet(stats_path)
     encoder_data_dir = APP_DIR.parent / "draft_encoder" / "data"
     mapping, champ_meta = build_champion_metadata(encoder_data_dir)
     if mapping:
