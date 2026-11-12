@@ -71,7 +71,7 @@ OBJECTIVE_LABELS = {"dragon": "Dragon", "herald": "Herald", "baron": "Baron", "t
 DDRAGON_VERSION = "14.24.1"
 POST_14_24_CHAMPS = {"Mel", "Yunara", "Zaahen"}
 SPLASH_ID_OVERRIDES = {"Fiddlesticks": "FiddleSticks"}
-ENGINE_SCHEMA_VERSION = "v5_cloud_and_local_spa"
+ENGINE_SCHEMA_VERSION = "v6_interaction_payload"
 
 ROLE_ICONS = {
     "top": "https://raw.communitydragon.org/latest/plugins/rcp-fe-lol-clash/global/default/assets/images/position-selector/positions/icon-position-top.png",
@@ -2172,9 +2172,20 @@ initStudio();
 
 def build_spa_html(engine: FastDraftEngine, api_port: int) -> str:
     """Build the self-contained zero-refresh HTML/CSS/JS Champion Select Studio."""
-    # Auto-heal if Streamlit Cloud passed a cached FastDraftEngine instance from an older commit
-    if not hasattr(engine, "syn_wr_list") or not hasattr(engine, "rich_profiles"):
+    required_payload_attrs = (
+        "syn_wr_list",
+        "cnt_wr_list",
+        "sparse_lane_map",
+        "rich_profiles",
+    )
+    if any(not hasattr(engine, attr) for attr in required_payload_attrs):
         engine._precompute_interaction_matrices()
+    missing_attrs = [attr for attr in required_payload_attrs if not hasattr(engine, attr)]
+    if missing_attrs:
+        raise RuntimeError(
+            "Draft engine interaction payload is incomplete after initialization: "
+            + ", ".join(missing_attrs)
+        )
 
     initial_draft = DEMO_PRESETS["Mid-Draft (7/10)"]
     initial_analysis = engine.analyze(
