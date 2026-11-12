@@ -2,3 +2,4 @@
 lol_collector/draft_encoder/data/processed_riot/*.parquet filter=lfs diff=lfs merge=lfs -text
 lol_collector/draft_encoder/data/processed_riot/splits.json filter=lfs diff=lfs merge=lfs -text
 lol_collector/draft_analyzer/analysis_output/*.parquet filter=lfs diff=lfs merge=lfs -text
+lol_collector/draft_encoder/checkpoints/best.pt filter=lfs diff=lfs merge=lfs -text
